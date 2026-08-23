@@ -1,7 +1,8 @@
 # zurl
 
-An experimental `std.Io`-native HTTP/1.1 client for Zig 0.16, zero
-dependencies. Read before writing code:
+An experimental `std.Io`-native HTTP/1.1 client for Zig 0.16. One dependency,
+`zoxy-io/hparse`, for the head scan; no runtime and no TLS stack (rule 6).
+Read before writing code:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — the eight rules, each traceable to an
   incident that cost the zoxy benchmark harness a real run. Bare *rule N*
@@ -62,10 +63,12 @@ build with 0.15 or with master — `std.Io` moves.
 
 ## Policies
 
-- **Zero dependencies** (rule 6). zurl imports `std` and nothing else, so that
-  it is a *leaf* package: a consumer that already pins zio or a TLS stack must
-  never end up with two copies of one. A `.dependencies` entry in
-  `build.zig.zon` needs a written argument that the transport seam cannot
+- **Leaf package** (rule 6). zurl imports `std` and `hparse` and nothing else:
+  a consumer that already pins zio or a TLS stack must never end up with two
+  copies of one. The rule used to say *zero* dependencies; it now names the
+  four things a pin has to clear, because "zero" was a proxy for leaf-ness
+  rather than the property itself. A new `.dependencies` entry needs a written
+  argument against all four — starting with why the transport seam cannot
   carry it instead.
 - **Zero allocation.** No function under `src/` takes an `Allocator`. Memory
   that grows during a fetch belongs to a caller-supplied

@@ -1,10 +1,17 @@
-//! The hparse experiment: is zoxy-io/hparse's SIMD head parser worth a
-//! dependency in a package whose whole point is being a leaf?
+//! The head-parser comparison: zoxy-io/hparse's SIMD scanner against the
+//! hand-rolled `Io.Reader` one it replaced.
 //!
-//! Temporary, opt-in (`zig build bench-head -Dhparse -Doptimize=ReleaseFast`),
-//! and deliberately living in bench/ rather than src/: the library stays
-//! zero-dependency (rule 6) whichever way the answer goes, and if the answer
-//! is yes the code moves then and not before.
+//! `zig build bench-head -Doptimize=ReleaseFast`. This began as an opt-in
+//! experiment behind `-Dhparse`, asking whether hparse was worth a dependency
+//! in a package whose whole point is being a leaf. The answer came back yes
+//! once the resume cursor landed, and `src/parser.zig` runs on hparse now, so
+//! the gate is gone. The harness stays: the `segmented` column below is where
+//! the adoption was supposed to pay, and rule 8 says the line that shows it is
+//! part of the change.
+//!
+//! The `zurl` column is therefore a HISTORICAL BASELINE — the scanner as it
+//! was before adoption, kept here to measure against. It is not what
+//! src/parser.zig does today.
 //!
 //! Prints numbers and asserts nothing about them (rule 8) — but it DOES
 //! assert that the two parsers agree, because a faster parser that answers
@@ -15,10 +22,12 @@
 //!   whole      — the entire head already in the reader's buffer. The best
 //!                case for hparse, and what a microbenchmark usually shows.
 //!   segmented  — the head arriving in transport-sized pieces, which is what
-//!                a socket actually does. hparse parses a CONTIGUOUS slice
-//!                and returns error.Incomplete, so every new segment re-parses
-//!                the head from byte zero; zurl's parse is line-at-a-time and
-//!                never revisits a byte.
+//!                a socket actually does. This column is the whole story: the
+//!                one-shot `parseResponse` re-parses from byte zero on every
+//!                segment, which is the O(N²) blowup docs/RESEARCH.md
+//!                measured at 250,702 ns for a 30-header head arriving one
+//!                byte at a time. `parseResponseResume` is what fixed it, and
+//!                what src/parser.zig calls.
 
 const std = @import("std");
 const zurl = @import("zurl");

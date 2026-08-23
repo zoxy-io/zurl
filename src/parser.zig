@@ -18,8 +18,17 @@
 //! free to choose. Errors survive every build mode; assertions do not.
 
 const std = @import("std");
+const hparse = @import("hparse");
 const Io = std.Io;
 const assert = std.debug.assert;
+
+/// The most header fields one response head may carry.
+///
+/// hparse writes spans into a caller-supplied array and reports
+/// `TooManyHeaders` rather than growing one, which is the same bargain as every
+/// other buffer here: a stated bound and no allocation. 128 fields is far more
+/// than any origin sends and costs 4 KiB of stack frame.
+pub const headers_max = 128;
 
 pub const Error = error{
     MalformedStatusLine,
@@ -83,77 +92,136 @@ pub const Body = struct {
 
 /// Read the status line and headers, through the blank line.
 ///
-/// The reader's buffer bounds the longest single line; `max_head_bytes` bounds
-/// the head as a whole, so a server spewing endless valid-sized header lines
-/// still terminates.
+/// The head must arrive WHOLE inside the reader's buffer. hparse scans a
+/// contiguous slice, so the buffer bounds the entire head rather than only the
+/// longest line as the hand-rolled scanner did; `max_head_bytes` bounds it
+/// again, and whichever is smaller wins. A server spewing endless valid-sized
+/// header lines still terminates, now against a bound one line earlier.
+///
+/// Segmentation cannot change the answer (rule 4). hparse's `Resume` carries
+/// the scan position through a partial parse, so a head arriving one byte at a
+/// time is scanned once, not once per segment — that quadratic re-scan is the
+/// whole reason the dependency was worth taking. docs/RESEARCH.md has the
+/// numbers.
 pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
-    // Both are bounds the caller chose: the reader's buffer limits the longest
-    // single line, `max_head_bytes` the head as a whole. A zero for either
-    // means no head can ever parse, which is a caller bug, not a bad server.
+    // Both are bounds the caller chose. A zero for either means no head can
+    // ever parse, which is a caller bug, not a bad server.
     assert(opts.max_head_bytes > 0);
     assert(r.buffer.len > 0);
 
-    var budget = opts.max_head_bytes;
+    var state: hparse.Resume = .{};
+    var headers: [headers_max]hparse.Header = undefined;
+    var header_count: usize = 0;
+    var version: hparse.Version = .@"1.0";
+    var status: u16 = 0;
+    var status_msg: ?[]const u8 = null;
 
-    const status_line = try takeLine(r, &budget);
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.")) return error.MalformedStatusLine;
-    const http11 = std.mem.startsWith(u8, status_line, "HTTP/1.1");
+    // lint:unbounded-ok — every pass either returns or adds at least one byte
+    // to `r.buffered()`, and the two guards below refuse once that reaches the
+    // smaller of `max_head_bytes` and the reader's buffer. Both are finite, so
+    // this terminates whatever the peer does.
+    const consumed = head: while (true) {
+        // The budget caps what the HEAD may consume, so the window handed to
+        // hparse is capped too — not the reader's buffered length, which also
+        // holds however much of the body has arrived. Testing the latter made
+        // the verdict depend on how much turned up in one read, which is rule
+        // 4's exact prohibition; the fuzz oracle caught it on the first run.
+        const buffered = r.buffered();
+        const window = buffered[0..@min(buffered.len, opts.max_head_bytes)];
 
-    // "HTTP/1.1 200 OK" — the token after the first space, exactly three
-    // digits (RFC 9112 §4), so every status lands in a 1xx..5xx class bucket.
-    const first_space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return error.MalformedStatusLine;
-    const after = status_line[first_space + 1 ..];
-    const code_end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
-    const status = std.fmt.parseInt(u16, after[0..code_end], 10) catch return error.MalformedStatusLine;
+        if (hparse.parseResponseResume(
+            window,
+            &state,
+            &version,
+            &status,
+            &status_msg,
+            &headers,
+            &header_count,
+        )) |n| {
+            break :head n;
+        } else |err| switch (err) {
+            // hparse reports one `Invalid` for the whole head. `line_done` is
+            // what says which half of this file's taxonomy it belongs to: it
+            // is set the moment the status line parses, so still-false means
+            // the status line is what failed.
+            error.Invalid => return if (state.line_done)
+                error.MalformedHeader
+            else
+                error.MalformedStatusLine,
+            // Rule 7: refused whole, never clipped to the first 128 fields.
+            error.TooManyHeaders => return error.HeadTooLong,
+            error.Incomplete => {},
+        }
+
+        // A head still unterminated after spending its whole budget, or with
+        // nowhere left to put more bytes, has outgrown its bound rather than
+        // arrived slowly — and the distinction matters, because one is the
+        // peer's fault and the other is a timeout.
+        if (window.len == opts.max_head_bytes) return error.HeadTooLong;
+        if (r.bufferedLen() == r.buffer.len) return error.HeadTooLong;
+
+        r.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEof,
+            error.ReadFailed => return error.ReadFailed,
+        };
+    };
+
+    // RFC 9112 §4: exactly three digits, so every status lands in a 1xx..5xx
+    // class bucket and `bodyless` can divide by 100.
     if (status < 100 or status > 999) return error.MalformedStatusLine;
+    assert(consumed <= r.bufferedLen());
 
     var head: Head = .{
         .status = status,
-        .http11 = http11,
+        .http11 = version == .@"1.1",
         // HTTP/1.1 defaults to keep-alive; 1.0 defaults to close.
-        .keep_alive = http11,
+        .keep_alive = version == .@"1.1",
     };
 
-    // lint:unbounded-ok — every pass charges at least one byte against
-    // `budget` in takeLine, which returns error.HeadTooLong once it runs out.
-    // That is what terminates a server sending valid-sized headers forever.
-    while (true) {
-        const line = try takeLine(r, &budget);
-        assert(budget < opts.max_head_bytes);
-        if (line.len == 0) break;
-
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
-        const name = line[0..colon];
-        if (name.len == 0) return error.MalformedHeader;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHeader;
-            if (head.content_length) |prev| {
-                // Duplicate Content-Length: equal copies are tolerated (some
-                // proxies stack them), a DISAGREEMENT is the request-smuggling
-                // primitive and is refused outright.
-                if (prev != n) return error.MalformedHeader;
-            }
-            head.content_length = n;
-        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            if (containsTokenIgnoreCase(value, "chunked")) head.chunked = true;
-        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            if (containsTokenIgnoreCase(value, "close")) {
-                head.keep_alive = false;
-            } else if (containsTokenIgnoreCase(value, "keep-alive")) {
-                head.keep_alive = true;
-            }
-        }
-
-        if (opts.on_header) |f| f(opts.ctx, name, value);
+    for (headers[0..header_count]) |field| {
+        try applyFraming(&head, field.key, field.value);
+        if (opts.on_header) |f| f(opts.ctx, field.key, field.value);
     }
 
-    // The status was range-checked before the loop and the loop only ever
-    // narrows the head, so the range still holds at the exit.
+    // Only now. Every slice above points into the reader's buffer, and tossing
+    // is what lets the body stream overwrite it.
+    r.toss(consumed);
+
+    // Range-checked above, and `applyFraming` never touches the status.
     assert(head.status >= 100);
     assert(head.status <= 999);
     return head;
+}
+
+/// Fold one header field into the head's framing decision.
+///
+/// Rule 2: this is the only place a header changes how the body is read, and
+/// it is deliberately separate from the scan that produced the field — hparse
+/// decides what a header IS, zurl decides what it MEANS.
+fn applyFraming(head: *Head, name: []const u8, value: []const u8) Error!void {
+    // hparse rejects an empty field name before it ever reaches here, so this
+    // states what the parse established rather than trusting the peer.
+    assert(name.len > 0);
+    assert(head.status >= 100);
+
+    if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+        const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHeader;
+        if (head.content_length) |prev| {
+            // Duplicate Content-Length: equal copies are tolerated (some
+            // proxies stack them), a DISAGREEMENT is the request-smuggling
+            // primitive and is refused outright.
+            if (prev != n) return error.MalformedHeader;
+        }
+        head.content_length = n;
+    } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+        if (containsTokenIgnoreCase(value, "chunked")) head.chunked = true;
+    } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+        if (containsTokenIgnoreCase(value, "close")) {
+            head.keep_alive = false;
+        } else if (containsTokenIgnoreCase(value, "keep-alive")) {
+            head.keep_alive = true;
+        }
+    }
 }
 
 /// Deliver the body (decoded, if chunked) to `sink`, per the head's framing.
@@ -511,4 +579,32 @@ test "headers are delivered through the callback with trimmed values" {
     var ctx: Ctx = .{};
     _ = try parseHead(&sr.interface, .{ .on_header = Ctx.on, .ctx = &ctx });
     try t.expectEqual(@as(usize, 1), ctx.seen);
+}
+
+test "bare LF line endings are refused in the head, CRLF only" {
+    // A behaviour CHANGE, and a deliberate one. The hand-rolled scanner
+    // stripped an optional CR and so accepted bare-LF heads, which RFC 9112
+    // §2.2 permits a recipient to do; hparse is CRLF-only, which it is
+    // permitted to be, and docs/RESEARCH.md listed this as the adoption cost
+    // that reaches a caller. It is recorded here so the strictness is a
+    // decision rather than a side effect nobody noticed.
+    //
+    // Refusing is the safer half of the choice: bare LF inside a head is the
+    // request-smuggling primitive intermediaries disagree over (rule 2), and
+    // a client that rejects it cannot be the party that disagrees.
+    const wire = "HTTP/1.1 200 OK\ncontent-length: 5\n\nhello";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire, wire.len, null, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try t.expectError(error.MalformedStatusLine, parseAll(&sr.interface, .GET, &out));
+
+    // CRLF in the status line but bare LF between fields fails as a header,
+    // not as a status line — the taxonomy still tells the caller where.
+    const mixed = "HTTP/1.1 200 OK\r\ncontent-length: 5\n\r\nhello";
+    var buf2: [256]u8 = undefined;
+    var sr2 = SegmentedReader.init(mixed, mixed.len, null, &buf2);
+    var out2: Io.Writer.Allocating = .init(t.allocator);
+    defer out2.deinit();
+    try t.expectError(error.MalformedHeader, parseAll(&sr2.interface, .GET, &out2));
 }

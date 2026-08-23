@@ -57,7 +57,8 @@ llhttp numbers are the thing to compare against before writing a SIMD parser.
 
 ### zoxy-io/hparse — measured, and the measurement changed the question
 
-Reproduce: `zig build bench-head -Dhparse -Doptimize=ReleaseFast`.
+Reproduce: `zig build bench-head -Doptimize=ReleaseFast` (the `-Dhparse` gate
+is gone; hparse is a real dependency now).
 
 hparse is a zero-allocation SIMD head parser we already own and already ship
 inside zoxy. The question was whether zurl should take it as a dependency; the
@@ -121,17 +122,48 @@ already filled + whether the request line is done) so an incomplete parse
 continues where it stopped instead of restarting. `parseHeaders` already fails
 at clean line boundaries, so the resume point exists; it just is not reported.
 
-**Verdict for zurl: not yet, and for reasons that are now secondary.** Even at
-its best hparse saves ~15–30 ns of fixed cost, which is 0.2–0.3% of a 10 µs
-round trip; it needs a caller-supplied `[]Header` array with a
-`TooManyHeaders` failure zurl's callback API does not have; it cannot express
-`HeadTooLong` for a head larger than the buffer, because a contiguous-slice
-parser has no equivalent of `takeDelimiterInclusive`'s `StreamTooLong`; and it
-is strictly CRLF-only, so a bare-LF head that zurl parses today becomes
-`MalformedHeader`. That strictness is *right for an intermediary* — two
-parsers disagreeing about where a line ends is request smuggling — and wrong
-for a client, where it turns a lenient origin into an outage. Revisit if the
-resume cursor lands.
+**Verdict, first pass: not yet.** Even at its best hparse saved ~15–30 ns of
+fixed cost, 0.2–0.3% of a 10 µs round trip, and the quadratic re-scan above
+was disqualifying on its own.
+
+#### The resume cursor landed, and the verdict flipped
+
+hparse `87fd39d` added `parseResponseResume`, and then went further than the
+sketch above: resume is *intra-line*, so a partial header line continues
+mid-scan rather than restarting at its first byte. The bound is `n`, not
+`n * longest_line`:
+
+| head, segmentation | before | after | speedup |
+| --- | --- | --- | ---: |
+| 64 KiB, 1-byte | 2.19 GB / 379 ms | 66,909 B / 90.8 µs | 4172× |
+| 8 KiB, 1-byte | 39 MB / 8.5 ms | 9,549 B / 13.4 µs | 633× |
+
+The head is 66,218 bytes and the parser now touches 66,909 of them: one pass
+plus a byte of look-ahead per call. **zurl adopted it** — `src/parser.zig`
+imports hparse, and rule 6 was rewritten from "zero dependencies" to the four
+things a pin must clear.
+
+The three adoption costs listed above were real, and this is what each cost:
+
+* **Caller-supplied `[]Header` + `TooManyHeaders`.** Became
+  `parser.headers_max = 128`, a stack array and a stated bound — the same
+  bargain as every other buffer here. `TooManyHeaders` maps to `HeadTooLong`:
+  refused whole, never clipped to the first 128 fields (rule 7).
+* **No `HeadTooLong` for an over-long head.** The contiguous parser has no
+  `StreamTooLong`, so zurl derives it instead: the window handed to hparse is
+  capped at `max_head_bytes`, and `Incomplete` against a full window *is* the
+  error. Getting this wrong the obvious way — testing `r.buffered().len`,
+  which also holds body bytes — made the verdict depend on how much arrived in
+  one read. The rule-4 fuzz oracle caught it on the first run.
+* **CRLF-only.** Accepted, and now pinned by a test. A bare-LF head that the
+  hand-rolled scanner parsed is `MalformedStatusLine` today. The trade is real
+  — it can turn a lenient origin into an outage — but a bare LF inside a head
+  is the smuggling primitive intermediaries disagree over, and a client that
+  refuses it cannot be the party that disagrees.
+
+One consequence worth stating plainly: the head must now fit **whole** in the
+reader's buffer, where before only the longest single line had to. A
+contiguous-slice parser cannot be given less.
 
 **Open question against ourselves:** hparse validates header name and value
 bytes; `src/parser.zig` does not. A header name containing a control
