@@ -46,6 +46,11 @@ pub const Error = error{
     TlsNotConfigured,
     ConnectFailed,
     OutOfMemory,
+    /// The Io backend could not give this fetch a thread for its deadline
+    /// sleeper, so the request would have run unbounded. Refused instead of
+    /// run: an unbounded request is the incident rule 3 exists to prevent,
+    /// and it is better to say so than to hang.
+    ConcurrencyUnavailable,
 } || connection.Error || tls_transport.Error;
 
 /// The longest legal DNS name, and so the longest host `fetch` will dial. It
@@ -262,9 +267,23 @@ pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
         }
     };
 
+    // `concurrent`, not `async`, and this is the whole mechanism. Io.Threaded
+    // falls back to running an `async` task INLINE on the calling thread when
+    // `busy_count >= async_limit`, and that limit defaults to cpu_count - 1 —
+    // zero on a one-core box. Inline means `work` would run to completion
+    // before `sleeper` was ever created, so a black-holed request would hang
+    // forever with no deadline at all: nightly run #9 word for word, from the
+    // mechanism written to prevent it. CI caught exactly that on a
+    // four-core runner.
+    //
+    // `concurrent` is the API that promises a real thread and reports
+    // ConcurrencyUnavailable instead of silently degrading. It is bounded by
+    // `concurrent_limit` (unlimited by default), not by cpu_count, so a
+    // single-core host still gets its deadline.
     var group: Io.Group = .init;
-    group.async(io, Race.work, .{ &task, &queue, io });
-    group.async(io, Race.sleeper, .{ req.deadline_ns, &queue, io });
+    errdefer group.cancel(io);
+    try group.concurrent(io, Race.work, .{ &task, &queue, io });
+    try group.concurrent(io, Race.sleeper, .{ req.deadline_ns, &queue, io });
 
     const event = queue.getOneUncancelable(io) catch Event.deadline;
     group.cancel(io);
@@ -355,7 +374,11 @@ test "fetch against a live loopback server, deadline against a black hole" {
     };
     var group: Io.Group = .init;
     defer group.cancel(io);
-    group.async(io, Serve.run, .{ &server, io });
+    // `concurrent`: the origin must actually run beside the client. Under
+    // plain `async` a host whose async_limit is exhausted runs Serve.run
+    // inline and the test deadlocks on its own server -- which is what a
+    // single-CPU run of this file did before fetch stopped using `async`.
+    try group.concurrent(io, Serve.run, .{ &server, io });
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
@@ -374,4 +397,21 @@ test "fetch against a live loopback server, deadline against a black hole" {
         .what = "black hole",
     });
     try t.expectEqual(@as(?connection.Response, null), timed_out);
+}
+
+test "a backend that cannot spawn refuses the fetch rather than running it unbounded" {
+    // concurrent_limit .nothing is the shape of an Io whose threads are all
+    // committed: `concurrent` cannot promise a deadline sleeper. The old code
+    // used `async`, which answers that by running the request INLINE with no
+    // deadline at all -- unbounded, on a host already out of resources. The
+    // contract now is that fetch says so before it dials.
+    var threaded: Io.Threaded = .init(t.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try t.expectError(error.ConcurrencyUnavailable, fetch(io, .{
+        .url = "http://127.0.0.1:1/never-dialed",
+        .deadline_ns = 100 * std.time.ns_per_ms,
+        .what = "unspawnable",
+    }));
 }
