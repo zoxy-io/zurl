@@ -66,6 +66,38 @@ pub const Error = error{
 /// never copied anywhere.
 const host_bytes_max: usize = 253;
 
+/// The origin-form request target for `uri`: path, plus query when present,
+/// written into `buf` and validated.
+///
+/// `buf` is the bound on the whole target. A path and query that will not fit
+/// is `error.InvalidUrl` — never a truncated target, which would silently
+/// request a different resource (rule 7).
+///
+/// `std.Uri.parse` is not the validation it looks like. It ACCEPTS CR, LF and
+/// spaces inside a path and hands them back verbatim in `percent_encoded`,
+/// which is how a URL becomes request-header injection. `writeRequest` refuses
+/// them too — that is what covers a caller using `Connection` directly — but a
+/// fetch should not spend a socket to find out, and `InvalidUrl` is the truer
+/// answer here: what the caller passed was a URL.
+fn originFormTarget(uri: std.Uri, host: []const u8, buf: []u8) error{InvalidUrl}![]const u8 {
+    assert(buf.len > 0);
+    assert(host.len > 0);
+
+    var tw: Io.Writer = .fixed(buf);
+    const path = uri.path.percent_encoded;
+    tw.writeAll(if (path.len == 0) "/" else path) catch return error.InvalidUrl;
+    if (uri.query) |q| tw.print("?{s}", .{q.percent_encoded}) catch return error.InvalidUrl;
+
+    const target = tw.buffered();
+    connection.validateTarget(target, host) catch return error.InvalidUrl;
+
+    // A URI with an authority has an empty path or one beginning with a slash,
+    // and the empty case was just replaced — so origin-form holds.
+    assert(target.len > 0);
+    assert(target[0] == '/');
+    return target;
+}
+
 const Task = struct {
     io: Io,
     req: *const FetchRequest,
@@ -112,6 +144,11 @@ const Task = struct {
         };
         if (host.len == 0 or host.len > host_bytes_max) return error.InvalidUrl;
 
+        // Built BEFORE the dial, so a URL that cannot become a request line
+        // costs nothing — the same reason TlsNotConfigured is checked above.
+        var target_buf: [2048]u8 = undefined;
+        const target = try originFormTarget(uri, host, &target_buf);
+
         // One buffer serves the whole exchange: dial by IP literal when the
         // host is one, by name otherwise.
         var stream: net.Stream = blk: {
@@ -124,24 +161,13 @@ const Task = struct {
         };
         defer stream.close(io);
 
-        // origin-form target: path, plus query when present.
-        var target_buf: [2048]u8 = undefined;
-        var tw: Io.Writer = .fixed(&target_buf);
-        const path = uri.path.percent_encoded;
-        tw.writeAll(if (path.len == 0) "/" else path) catch return error.InvalidUrl;
-        if (uri.query) |q| tw.print("?{s}", .{q.percent_encoded}) catch return error.InvalidUrl;
-        // A URI with an authority has an empty path or one that begins with a
-        // slash, and the empty case was just replaced — so origin-form holds.
-        assert(tw.buffered().len > 0);
-        assert(tw.buffered()[0] == '/');
-
         // The two transports get their own frames on purpose. TLS needs four
         // buffers and two of them must each hold a whole ciphertext record, so
         // its frame is ~66 KiB; a plain-HTTP fetch has no business reserving
         // that. Zig sizes a frame for all of its own locals, not for the
         // branch taken, so the split is what keeps the http path at 20 KiB.
-        if (secure) return task.exchangeTls(&stream, host, tw.buffered());
-        return task.exchangePlain(&stream, host, tw.buffered());
+        if (secure) return task.exchangeTls(&stream, host, target);
+        return task.exchangePlain(&stream, host, target);
     }
 
     /// The request every exchange sends, built once so the two transports
@@ -460,4 +486,34 @@ test "a second spawn that fails unwinds the first without freeing it under a liv
         .deadline_ns = 100 * std.time.ns_per_ms,
         .what = "half-spawnable",
     }));
+}
+
+test "a URL that would inject request headers is refused before any dial" {
+    // std.Uri.parse ACCEPTS every one of these and hands the path back
+    // verbatim, so without an explicit check `fetch` would write the CRLF
+    // straight into the request line and let whoever chose the URL append
+    // headers to zurl's request. std.http.Client has the same hole today
+    // (docs/RESEARCH.md), which is why this is a test and not a comment.
+    //
+    // Port 1 on loopback: if any of these ever DID reach the dial, the test
+    // would fail on ConnectFailed rather than passing by accident.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const poisoned = [_][]const u8{
+        "http://127.0.0.1:1/a\r\nX-Injected: 1",
+        "http://127.0.0.1:1/a\nX-Injected: 1",
+        "http://127.0.0.1:1/a b",
+        "http://127.0.0.1:1/a\x00b",
+        "http://127.0.0.1:1/a?q=1\r\nX: 2",
+    };
+
+    for (poisoned) |url| {
+        try t.expectError(error.InvalidUrl, fetch(io, .{
+            .url = url,
+            .deadline_ns = 100 * std.time.ns_per_ms,
+            .what = "poisoned url",
+        }));
+    }
 }
