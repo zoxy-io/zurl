@@ -109,18 +109,95 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
     assert(opts.max_head_bytes > 0);
     assert(r.buffer.len > 0);
 
-    var state: hparse.Resume = .{};
+    // `undefined`, and a local rather than a field of `Scan`: see Scan.
     var headers: [headers_max]hparse.Header = undefined;
-    var header_count: usize = 0;
-    var version: hparse.Version = .@"1.0";
-    var status: u16 = 0;
-    var status_msg: ?[]const u8 = null;
+    var scan: Scan = .{};
+    const consumed = try scanHead(r, opts, &scan, &headers);
 
-    // lint:unbounded-ok — every pass either returns or adds at least one byte
-    // to `r.buffered()`, and the two guards below refuse once that reaches the
-    // smaller of `max_head_bytes` and the reader's buffer. Both are finite, so
-    // this terminates whatever the peer does.
-    const consumed = head: while (true) {
+    // RFC 9112 §4: exactly three digits, so every status lands in a 1xx..5xx
+    // class bucket and `bodyless` can divide by 100.
+    if (scan.status < 100 or scan.status > 999) return error.MalformedStatusLine;
+    assert(consumed <= r.bufferedLen());
+
+    var head: Head = .{
+        .status = scan.status,
+        .http11 = scan.version == .@"1.1",
+        // HTTP/1.1 defaults to keep-alive; 1.0 defaults to close.
+        .keep_alive = scan.version == .@"1.1",
+    };
+
+    for (headers[0..scan.header_count]) |field| {
+        try applyFraming(&head, field.key, field.value);
+        if (opts.on_header) |f| f(opts.ctx, field.key, field.value);
+    }
+
+    // Only now. Every slice above points into the reader's buffer, and tossing
+    // is what lets the body stream overwrite it.
+    r.toss(consumed);
+
+    // Range-checked above, and `applyFraming` never touches the status.
+    assert(head.status >= 100);
+    assert(head.status <= 999);
+    return head;
+}
+
+/// Everything `scanHead` fills in, so that `parseHead` can hand hparse one
+/// pointer instead of six and still fit in a screen.
+///
+/// The 128-entry header array is deliberately NOT a field here. Defaulting a
+/// 4 KiB array inside a `= .{}` struct literal makes the compiler materialise
+/// an initialiser for it on every parse, which cost 5x on small-cl and 10x on
+/// zrk-1k when this struct was first written that way -- caught by bench-parse,
+/// exactly as rule 8 intends. It stays an `undefined` local in `parseHead` and
+/// is passed by pointer, which also satisfies hparse's `Resume` contract that
+/// every resumed call see the SAME array.
+const Scan = struct {
+    state: hparse.Resume = .{},
+    header_count: usize = 0,
+    version: hparse.Version = .@"1.0",
+    status: u16 = 0,
+    /// hparse writes the reason phrase whether or not anyone wants it; `Head`
+    /// has no field for it and nothing reads it. Kept only because the API is
+    /// positional, not because it is a forgotten wire-up.
+    status_msg: ?[]const u8 = null,
+};
+
+/// Grow the reader's buffer until hparse can parse a whole head out of it, and
+/// return how many bytes that head occupies.
+///
+/// ## What stops this
+///
+/// The caller's whole-request deadline (rule 3), NOT a byte count — and the
+/// difference is worth stating because two of the three exits look like byte
+/// counts and the third is not.
+///
+/// The budget guard and the full-buffer guard both fire after a finite number
+/// of PRODUCTIVE reads, because each of those adds at least one byte. But
+/// `Io.Reader.fillMore` documents that it "may result in zero bytes added to
+/// the buffer, which is not an end of stream condition": a TLS transport
+/// consuming a NewSessionTicket or KeyUpdate record does exactly that, and a
+/// peer willing to send those forever keeps this loop running without ever
+/// tripping either guard.
+///
+/// That is bounded by the peer's own bandwidth rather than by us — every such
+/// pass consumes a record the peer had to send — which is the same bargain
+/// `streamChunked` already makes: a slow origin and a malicious one differ in
+/// duration, not in shape, and only the caller knows which it asked for.
+/// `fetch` supplies rule 3's deadline; a caller driving `Connection` directly
+/// owns that choice, and this is where it gets spent.
+fn scanHead(
+    r: *Io.Reader,
+    opts: HeadOptions,
+    scan: *Scan,
+    headers: *[headers_max]hparse.Header,
+) Error!usize {
+    assert(opts.max_head_bytes > 0);
+    assert(r.buffer.len > 0);
+
+    // lint:unbounded-ok — see this function.s doc comment: bounded by the
+    // caller.s deadline (rule 3), not by a byte count, because fillMore may
+    // legitimately add zero bytes without signalling end of stream.
+    while (true) {
         // The budget caps what the HEAD may consume, so the window handed to
         // hparse is capped too — not the reader's buffered length, which also
         // holds however much of the body has arrived. Testing the latter made
@@ -131,20 +208,21 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
 
         if (hparse.parseResponseResume(
             window,
-            &state,
-            &version,
-            &status,
-            &status_msg,
-            &headers,
-            &header_count,
-        )) |n| {
-            break :head n;
+            &scan.state,
+            &scan.version,
+            &scan.status,
+            &scan.status_msg,
+            headers,
+            &scan.header_count,
+        )) |consumed| {
+            assert(consumed <= window.len);
+            return consumed;
         } else |err| switch (err) {
             // hparse reports one `Invalid` for the whole head. `line_done` is
             // what says which half of this file's taxonomy it belongs to: it
             // is set the moment the status line parses, so still-false means
             // the status line is what failed.
-            error.Invalid => return if (state.line_done)
+            error.Invalid => return if (scan.state.line_done)
                 error.MalformedHeader
             else
                 error.MalformedStatusLine,
@@ -164,33 +242,7 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
             error.EndOfStream => return error.UnexpectedEof,
             error.ReadFailed => return error.ReadFailed,
         };
-    };
-
-    // RFC 9112 §4: exactly three digits, so every status lands in a 1xx..5xx
-    // class bucket and `bodyless` can divide by 100.
-    if (status < 100 or status > 999) return error.MalformedStatusLine;
-    assert(consumed <= r.bufferedLen());
-
-    var head: Head = .{
-        .status = status,
-        .http11 = version == .@"1.1",
-        // HTTP/1.1 defaults to keep-alive; 1.0 defaults to close.
-        .keep_alive = version == .@"1.1",
-    };
-
-    for (headers[0..header_count]) |field| {
-        try applyFraming(&head, field.key, field.value);
-        if (opts.on_header) |f| f(opts.ctx, field.key, field.value);
     }
-
-    // Only now. Every slice above points into the reader's buffer, and tossing
-    // is what lets the body stream overwrite it.
-    r.toss(consumed);
-
-    // Range-checked above, and `applyFraming` never touches the status.
-    assert(head.status >= 100);
-    assert(head.status <= 999);
-    return head;
 }
 
 /// Fold one header field into the head's framing decision.
@@ -592,19 +644,35 @@ test "bare LF line endings are refused in the head, CRLF only" {
     // Refusing is the safer half of the choice: bare LF inside a head is the
     // request-smuggling primitive intermediaries disagree over (rule 2), and
     // a client that rejects it cannot be the party that disagrees.
-    const wire = "HTTP/1.1 200 OK\ncontent-length: 5\n\nhello";
-    var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire, wire.len, null, &buf);
-    var out: Io.Writer.Allocating = .init(t.allocator);
-    defer out.deinit();
-    try t.expectError(error.MalformedStatusLine, parseAll(&sr.interface, .GET, &out));
+    // Rejection is a wire-reading behaviour, so it gets rule 4's treatment
+    // like any other: the SAME error at every split position and byte-at-a-
+    // time, not just when the whole response lands in one read. A refusal that
+    // depends on where the transport split is the cAdvisor bug wearing an
+    // error code.
+    const cases = .{
+        // Bare LF throughout: the status line is what fails.
+        .{ "HTTP/1.1 200 OK\ncontent-length: 5\n\nhello", Error.MalformedStatusLine },
+        // CRLF status line, bare LF between fields: fails as a header
+        // instead, so the taxonomy still tells the caller where.
+        .{ "HTTP/1.1 200 OK\r\ncontent-length: 5\n\r\nhello", Error.MalformedHeader },
+    };
 
-    // CRLF in the status line but bare LF between fields fails as a header,
-    // not as a status line — the taxonomy still tells the caller where.
-    const mixed = "HTTP/1.1 200 OK\r\ncontent-length: 5\n\r\nhello";
-    var buf2: [256]u8 = undefined;
-    var sr2 = SegmentedReader.init(mixed, mixed.len, null, &buf2);
-    var out2: Io.Writer.Allocating = .init(t.allocator);
-    defer out2.deinit();
-    try t.expectError(error.MalformedHeader, parseAll(&sr2.interface, .GET, &out2));
+    inline for (cases) |case| {
+        const wire, const want = case;
+
+        var split: usize = 1;
+        while (split < wire.len) : (split += 1) {
+            var buf: [256]u8 = undefined;
+            var sr = SegmentedReader.init(wire, wire.len, split, &buf);
+            var out: Io.Writer.Allocating = .init(t.allocator);
+            defer out.deinit();
+            try t.expectError(want, parseAll(&sr.interface, .GET, &out));
+        }
+
+        var buf: [256]u8 = undefined;
+        var sr = SegmentedReader.init(wire, 1, null, &buf);
+        var out: Io.Writer.Allocating = .init(t.allocator);
+        defer out.deinit();
+        try t.expectError(want, parseAll(&sr.interface, .GET, &out));
+    }
 }

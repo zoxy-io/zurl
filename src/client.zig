@@ -50,6 +50,14 @@ pub const Error = error{
     /// sleeper, so the request would have run unbounded. Refused instead of
     /// run: an unbounded request is the incident rule 3 exists to prevent,
     /// and it is better to say so than to hang.
+    ///
+    /// `fetch` needs TWO concurrent slots — the request and the deadline that
+    /// bounds it — so this is returned when `concurrent_limit` is below two,
+    /// and ALWAYS on a `single_threaded` build, where `Io.Threaded` cannot
+    /// promise concurrency at all. That is a real limitation and it is stated
+    /// here rather than discovered: on such a build every `fetch` fails, and a
+    /// caller that wants an unbounded request must drive `Connection`
+    /// directly, which needs no threads and no deadline.
     ConcurrencyUnavailable,
 } || connection.Error || tls_transport.Error;
 
@@ -237,6 +245,29 @@ const Task = struct {
 /// every 20 ms, and bench/e2e.zig convicted it on its first run — a 120 us
 /// loopback request cost 20 ms of wall clock, a 166x latency floor that a
 /// correctness test can never see. Design rule 8 is not decorative.
+///
+/// Requires an `Io` that can actually run two things at once; see
+/// `Error.ConcurrencyUnavailable`.
+const Event = enum { done, deadline };
+
+/// The two racers. At file scope rather than inside `fetch` only to keep that
+/// function inside the 70-line limit — nothing else refers to them.
+const Race = struct {
+    fn work(tk: *Task, q: *Io.Queue(Event), rio: Io) void {
+        tk.run();
+        // A failed put means the deadline already won and `fetch` has stopped
+        // listening. The result is still in the Task; nobody will read it, and
+        // there is nothing here that could react instead.
+        q.putOne(rio, .done) catch {};
+    }
+    fn sleeper(ns: u64, q: *Io.Queue(Event), rio: Io) void {
+        // A cancelled sleep is the ordinary outcome — the request finished
+        // first — and it means the deadline never elapsed, so returning
+        // without posting anything is exactly right.
+        rio.sleep(.fromNanoseconds(ns), .awake) catch return;
+        q.putOne(rio, .deadline) catch {};
+    }
+};
 pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
     // A zero deadline would race the sleeper against a request that has not
     // started; `what` is what the timeout message names, so an empty one turns
@@ -246,26 +277,8 @@ pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
 
     var task: Task = .{ .io = io, .req = &req };
 
-    const Event = enum { done, deadline };
     var q_buf: [2]Event = undefined;
     var queue: Io.Queue(Event) = .init(&q_buf);
-
-    const Race = struct {
-        fn work(tk: *Task, q: *Io.Queue(Event), rio: Io) void {
-            tk.run();
-            // A failed put means the deadline already won and `fetch` has
-            // stopped listening. The result is still in the Task; nobody will
-            // read it, and there is nothing here that could react instead.
-            q.putOne(rio, .done) catch {};
-        }
-        fn sleeper(ns: u64, q: *Io.Queue(Event), rio: Io) void {
-            // A cancelled sleep is the ordinary outcome — the request finished
-            // first — and it means the deadline never elapsed, so returning
-            // without posting anything is exactly right.
-            rio.sleep(.fromNanoseconds(ns), .awake) catch return;
-            q.putOne(rio, .deadline) catch {};
-        }
-    };
 
     // `concurrent`, not `async`, and this is the whole mechanism. Io.Threaded
     // falls back to running an `async` task INLINE on the calling thread when
@@ -281,9 +294,20 @@ pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
     // `concurrent_limit` (unlimited by default), not by cpu_count, so a
     // single-core host still gets its deadline.
     var group: Io.Group = .init;
+
+    // The errdefer is not redundant with the `group.cancel` below it. If the
+    // SECOND `concurrent` fails, the first task is already running and holding
+    // pointers to `task` and `queue` — both locals of this frame. Returning
+    // straight out would free them under a live thread. `Group.cancel` joins
+    // before it returns, so this is what makes the early exit safe.
     errdefer group.cancel(io);
-    try group.concurrent(io, Race.work, .{ &task, &queue, io });
+
+    // Sleeper FIRST, and the order is load-bearing. Spawned the other way, a
+    // worker that had already reached the wire would have its result thrown
+    // away when the sleeper's spawn failed — a completed request discarded for
+    // want of a thread. This way a failure here means nothing was ever dialed.
     try group.concurrent(io, Race.sleeper, .{ req.deadline_ns, &queue, io });
+    try group.concurrent(io, Race.work, .{ &task, &queue, io });
 
     const event = queue.getOneUncancelable(io) catch Event.deadline;
     group.cancel(io);
@@ -413,5 +437,27 @@ test "a backend that cannot spawn refuses the fetch rather than running it unbou
         .url = "http://127.0.0.1:1/never-dialed",
         .deadline_ns = 100 * std.time.ns_per_ms,
         .what = "unspawnable",
+    }));
+}
+
+test "a second spawn that fails unwinds the first without freeing it under a live thread" {
+    // concurrent_limit 1 is the interesting case, and the one .nothing above
+    // cannot reach: the FIRST `concurrent` succeeds and the second is refused,
+    // so `fetch` must return an error while a task it started is still running
+    // and still holding pointers to `task` and `queue` — both locals of that
+    // frame. The errdefer'd `Group.cancel` joins before returning, which is the
+    // only reason this is not a use-after-free.
+    //
+    // A one-spare-thread budget is a legitimate configuration, not a
+    // pathological one, so this path is reachable in production and not just
+    // in a test that contrives it.
+    var threaded: Io.Threaded = .init(t.allocator, .{ .concurrent_limit = @enumFromInt(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try t.expectError(error.ConcurrencyUnavailable, fetch(io, .{
+        .url = "http://127.0.0.1:1/never-dialed",
+        .deadline_ns = 100 * std.time.ns_per_ms,
+        .what = "half-spawnable",
     }));
 }
