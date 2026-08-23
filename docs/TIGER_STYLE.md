@@ -86,8 +86,10 @@ say *what must be true*. Neither overrides the other.
   positive space (what you expect) **and** negative space (what you don't).
   Split `assert(a and b)` into `assert(a); assert(b);`. Use `if (a) assert(b);`
   for implications. Assert relationships between comptime constants.
-  Assertions are on in every build mode; they downgrade correctness bugs into
-  liveness bugs.
+  Assertions are `std.debug.assert`: live in Debug and ReleaseSafe, compiled
+  out of ReleaseFast — a mode the *consumer* chooses, not us. That is the
+  second reason wire input is validated with errors rather than assertions.
+  An error survives every build mode; an assertion does not.
 - **All errors handled.** No `catch unreachable` on a reachable error; no
   swallowed errors. A bare `catch {}` needs a comment proving it benign.
   (92% of catastrophic failures come from mishandled non-fatal errors —

@@ -38,6 +38,12 @@ item, and the transport seam is already the API.
 ReleaseFast, 8-core x86_64_v3 Linux box, 2026-08-23. Reproduce with
 `zig build bench-parse -Doptimize=ReleaseFast` and `bench-e2e`.
 
+State the power state alongside any number taken on a laptop: the same box
+and the same commit measure 1.7x slower across every row on battery
+(`powersave`, 1.2 GHz) than on AC (4.3 GHz boost). That is why the rule is
+bands compared inside one session against a baseline re-run in that session,
+never a number carried over from another day.
+
 **Parser microbench** (`Reader.fixed`, transport removed):
 
 | shape | ns/resp | throughput |
@@ -45,6 +51,14 @@ ReleaseFast, 8-core x86_64_v3 Linux box, 2026-08-23. Reproduce with
 | small-cl (8 headers, 128 B body) | 116 | 8.6 M resp/s |
 | zrk-1k (proxy-bench shape, 1 KiB body) | **61** | 16.5 M resp/s, 18.4 GB/s |
 | cadvisor (1.5 MiB chunked → LineSink) | 0.18 ms/scrape | 8.2 GB/s, 14.7 k lines |
+
+Assertions (docs/TIGER_STYLE.md) are `std.debug.assert`, so they are absent
+from the table above *by construction* — ReleaseFast compiles them out.
+Measured where they do run — ReleaseSafe, four A/B pairs interleaved against
+the same code without them: small-cl 129–132 → 133–137 ns, zrk-1k 68–70 →
+70–74 ns, cadvisor unmoved at 0.19–0.20 ms. Three to five percent on the
+head-heavy shapes and nothing on the body-heavy one, which spends its time in
+`streamExact64` and `LineSink.feed` rather than in the head.
 
 **End-to-end loopback** vs `std.http.Client`, same server, same Io, 1 KiB
 body, three runs:

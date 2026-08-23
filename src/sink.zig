@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 
 /// A response body consumed a line at a time, without ever holding more than
 /// one line of it.
@@ -41,6 +42,11 @@ pub const LineSink = struct {
         ctx: ?*anyopaque,
         onLine: *const fn (ctx: ?*anyopaque, line: []const u8) void,
     ) LineSink {
+        // Both slices are bounds, and a zero-length one is a caller bug that
+        // would otherwise surface as every line being reported overlong.
+        assert(buffer.len > 0);
+        assert(carry.len > 0);
+
         return .{
             .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer },
             .carry = carry,
@@ -53,7 +59,11 @@ pub const LineSink = struct {
     /// has ended (`Connection.roundTrip` does it for you); calling it twice is
     /// harmless.
     pub fn finish(self: *LineSink) void {
+        // `drain` below feeds the callback and always reports the full write,
+        // so this error union is structural and cannot actually fail.
         self.writer.flush() catch {};
+        assert(self.carry_len <= self.carry.len);
+
         if (self.carry_len == 0) return;
         const line = self.carry[0..self.carry_len];
         self.carry_len = 0;
@@ -61,7 +71,15 @@ pub const LineSink = struct {
     }
 
     fn feed(self: *LineSink, bytes: []const u8) void {
+        // The carry never overfills, on any exit path — and that invariant is
+        // exactly what makes the length limit a property of the line rather
+        // than of where the transport split the stream (rule 4).
+        assert(self.carry_len <= self.carry.len);
+        defer assert(self.carry_len <= self.carry.len);
+
         var rest = bytes;
+        // Bounded structurally: every pass either returns, breaks, or advances
+        // `rest` past a newline, so its length strictly decreases.
         while (rest.len > 0) {
             if (self.dropping) {
                 const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return;
@@ -103,6 +121,11 @@ pub const LineSink = struct {
     }
 
     fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        // The Io.Writer contract: `data` always carries at least the splat
+        // pattern, and `end` indexes within the buffer it belongs to.
+        assert(data.len > 0);
+        assert(w.end <= w.buffer.len);
+
         const self: *LineSink = @alignCast(@fieldParentPtr("writer", w));
         if (w.end > 0) {
             self.feed(w.buffer[0..w.end]);

@@ -10,9 +10,16 @@
 //! allocator. Head lines are parsed in place inside the reader's buffer;
 //! bodies stream through `Io.Reader.streamExact64`/`streamRemaining` without
 //! ever being held whole.
+//!
+//! Every assertion in this file states an INTERNAL invariant. Every byte it
+//! reads was written by someone else, so a malformed status line is expected
+//! input and returns an error: an assertion a remote server can trip is a
+//! remote panic, and it would vanish from the ReleaseFast build a consumer is
+//! free to choose. Errors survive every build mode; assertions do not.
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 
 pub const Error = error{
     MalformedStatusLine,
@@ -44,6 +51,11 @@ pub const Head = struct {
     /// body there eats into the next response and breaks framing — this is
     /// ziglang/zig#25181, open at `urgent` in std.http.Client today.
     pub fn bodyless(h: Head, method: std.http.Method) bool {
+        // Only ever called on a head `parseHead` returned, which range-checked
+        // the status; the class division below is meaningless without it.
+        assert(h.status >= 100);
+        assert(h.status <= 999);
+
         return method == .HEAD or h.status / 100 == 1 or h.status == 204 or h.status == 304;
     }
 };
@@ -75,6 +87,12 @@ pub const Body = struct {
 /// the head as a whole, so a server spewing endless valid-sized header lines
 /// still terminates.
 pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
+    // Both are bounds the caller chose: the reader's buffer limits the longest
+    // single line, `max_head_bytes` the head as a whole. A zero for either
+    // means no head can ever parse, which is a caller bug, not a bad server.
+    assert(opts.max_head_bytes > 0);
+    assert(r.buffer.len > 0);
+
     var budget = opts.max_head_bytes;
 
     const status_line = try takeLine(r, &budget);
@@ -96,8 +114,12 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
         .keep_alive = http11,
     };
 
+    // lint:unbounded-ok — every pass charges at least one byte against
+    // `budget` in takeLine, which returns error.HeadTooLong once it runs out.
+    // That is what terminates a server sending valid-sized headers forever.
     while (true) {
         const line = try takeLine(r, &budget);
+        assert(budget < opts.max_head_bytes);
         if (line.len == 0) break;
 
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
@@ -127,6 +149,10 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
         if (opts.on_header) |f| f(opts.ctx, name, value);
     }
 
+    // The status was range-checked before the loop and the loop only ever
+    // narrows the head, so the range still holds at the exit.
+    assert(head.status >= 100);
+    assert(head.status <= 999);
     return head;
 }
 
@@ -143,6 +169,8 @@ pub fn streamBody(
     sink: *Io.Writer,
     opts: HeadOptions,
 ) Error!Body {
+    assert(opts.max_head_bytes > 0);
+
     if (head.bodyless(method)) return .{ .len = 0, .keep_alive = head.keep_alive };
 
     if (head.chunked) {
@@ -150,6 +178,10 @@ pub fn streamBody(
         return .{ .len = n, .keep_alive = head.keep_alive };
     }
     if (head.content_length) |len| {
+        // Transfer-Encoding already won above, so a length that survives to
+        // here is the whole framing: streamExact64 delivers exactly it, or
+        // errors. There is no partial-body success to account for.
+        assert(!head.chunked);
         r.streamExact64(sink, len) catch |err| return switch (err) {
             error.EndOfStream => error.UnexpectedEof,
             error.ReadFailed => error.ReadFailed,
@@ -160,6 +192,8 @@ pub fn streamBody(
 
     // No framing information: the body runs to connection close, which is
     // itself the reason the connection cannot be kept alive.
+    assert(!head.chunked);
+    assert(head.content_length == null);
     const n = r.streamRemaining(sink) catch |err| return switch (err) {
         error.ReadFailed => error.ReadFailed,
         error.WriteFailed => error.WriteFailed,
@@ -168,7 +202,15 @@ pub fn streamBody(
 }
 
 fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
+    assert(opts.max_head_bytes > 0);
+
     var total: u64 = 0;
+    // lint:unbounded-ok — every pass consumes a chunk-size line and returns on
+    // the zero-size chunk, so it either advances the stream or ends. A server
+    // that streams chunks forever is bounded by the caller's whole-request
+    // deadline (rule 3), not by a byte cap: a 1.5 MiB cAdvisor scrape and a
+    // malicious stream differ in duration, not in shape, and only the caller
+    // knows which one it asked for.
     while (true) {
         var size_budget: usize = 1024; // a chunk-size line is a hex number and maybe extensions
         const size_line = takeLine(r, &size_budget) catch return error.MalformedChunk;
@@ -181,6 +223,8 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
             // Trailers: header lines until a blank line, delivered through the
             // same callback as headers, under a fresh head-sized budget.
             var budget = opts.max_head_bytes;
+            // lint:unbounded-ok — the head's bound exactly: takeLine charges
+            // every trailer line against `budget` and fails when it is spent.
             while (true) {
                 const line = takeLine(r, &budget) catch return error.MalformedChunk;
                 if (line.len == 0) return total;
@@ -191,6 +235,10 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
             }
         }
 
+        // The zero-size chunk returned above, so every pass reaching here moves
+        // the stream forward by at least one body byte — the loop's progress
+        // guarantee, stated where it is made.
+        assert(size > 0);
         r.streamExact64(sink, size) catch |err| return switch (err) {
             error.EndOfStream => error.MalformedChunk,
             error.ReadFailed => error.ReadFailed,
@@ -210,16 +258,25 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
 /// One head/trailer line: CRLF-terminated (bare LF tolerated), returned
 /// without the terminator, charged against `budget` at its raw on-wire size.
 fn takeLine(r: *Io.Reader, budget: *usize) Error![]const u8 {
+    const budget_before = budget.*;
+
     const raw = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
         error.StreamTooLong => return error.HeadTooLong,
         error.EndOfStream => return error.UnexpectedEof,
         error.ReadFailed => return error.ReadFailed,
     };
+    // takeDelimiterInclusive returns the delimiter with the line, so a
+    // successful line is never empty and the budget therefore strictly
+    // decreases. That is what bounds every loop in this file.
+    assert(raw.len > 0);
     if (raw.len > budget.*) return error.HeadTooLong;
     budget.* -= raw.len;
+    assert(budget.* < budget_before);
+
     var line = raw;
     if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
     if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    assert(line.len < raw.len); // the terminator is always stripped
     return line;
 }
 
@@ -227,6 +284,10 @@ fn takeLine(r: *Io.Reader, budget: *usize) Error![]const u8 {
 /// case-insensitively, as a whole token rather than a substring — "close"
 /// must not match a hypothetical "not-close".
 fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
+    // Every call site passes a comptime literal; an empty token would match
+    // every empty list element and quietly turn a header into a verdict.
+    assert(token.len > 0);
+
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |part| {
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;

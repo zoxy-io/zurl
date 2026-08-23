@@ -9,9 +9,9 @@
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 const net = std.Io.net;
 const connection = @import("connection.zig");
-const parser = @import("parser.zig");
 
 pub const default_deadline_ns: u64 = 30 * std.time.ns_per_s;
 
@@ -38,33 +38,48 @@ pub const Error = error{
     OutOfMemory,
 } || connection.Error;
 
+/// The longest legal DNS name, and so the longest host `fetch` will dial. It
+/// is a bound, not storage: the host is a slice of the caller's URL and is
+/// never copied anywhere.
+const host_bytes_max: usize = 253;
+
 const Task = struct {
     io: Io,
     req: *const FetchRequest,
-    host_buf: [253]u8 = undefined,
     result: ?(Error!connection.Response) = null,
-    done: std.atomic.Value(bool) = .init(false),
 
     fn run(task: *Task) void {
+        // One Task serves one request; a second run would overwrite a result
+        // the racing `fetch` may already be about to read.
+        assert(task.result == null);
+
         task.result = task.roundTrip();
-        task.done.store(true, .release);
     }
 
     fn roundTrip(task: *Task) Error!connection.Response {
         const io = task.io;
         const req = task.req;
 
+        // The URL is whatever string the caller was handed — from a config
+        // file, or from a request one hop upstream. Every rejection of it is
+        // an error, never an assertion: a consumer that forwards someone
+        // else's URL must not be able to panic this library from off-box.
+        if (req.url.len == 0) return error.InvalidUrl;
         const uri = std.Uri.parse(req.url) catch return error.InvalidUrl;
         if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.TlsNotImplemented;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidUrl;
+        // Port 0 means "let the kernel choose" to a listener and nothing at all
+        // to a dialer, so it is a bad URL rather than an assertion: it reaches
+        // us from whatever string the caller was handed.
         const port: u16 = uri.port orelse 80;
+        if (port == 0) return error.InvalidUrl;
 
         const host_component = uri.host orelse return error.InvalidUrl;
         const host = switch (host_component) {
             .raw => |h| h,
             .percent_encoded => |h| h,
         };
-        if (host.len == 0 or host.len > task.host_buf.len) return error.InvalidUrl;
+        if (host.len == 0 or host.len > host_bytes_max) return error.InvalidUrl;
 
         // One buffer serves the whole exchange: dial by IP literal when the
         // host is one, by name otherwise.
@@ -89,6 +104,10 @@ const Task = struct {
         const path = uri.path.percent_encoded;
         tw.writeAll(if (path.len == 0) "/" else path) catch return error.InvalidUrl;
         if (uri.query) |q| tw.print("?{s}", .{q.percent_encoded}) catch return error.InvalidUrl;
+        // A URI with an authority has an empty path or one that begins with a
+        // slash, and the empty case was just replaced — so origin-form holds.
+        assert(tw.buffered().len > 0);
+        assert(tw.buffered()[0] == '/');
 
         var conn = connection.Connection.init(&r.interface, &w.interface);
         return conn.roundTrip(.{
@@ -117,6 +136,12 @@ const Task = struct {
 /// loopback request cost 20 ms of wall clock, a 166x latency floor that a
 /// correctness test can never see. Design rule 8 is not decorative.
 pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
+    // A zero deadline would race the sleeper against a request that has not
+    // started; `what` is what the timeout message names, so an empty one turns
+    // the only diagnostic this function emits into noise.
+    assert(req.deadline_ns > 0);
+    assert(req.what.len > 0);
+
     var task: Task = .{ .io = io, .req = &req };
 
     const Event = enum { done, deadline };
@@ -126,9 +151,15 @@ pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
     const Race = struct {
         fn work(tk: *Task, q: *Io.Queue(Event), rio: Io) void {
             tk.run();
+            // A failed put means the deadline already won and `fetch` has
+            // stopped listening. The result is still in the Task; nobody will
+            // read it, and there is nothing here that could react instead.
             q.putOne(rio, .done) catch {};
         }
         fn sleeper(ns: u64, q: *Io.Queue(Event), rio: Io) void {
+            // A cancelled sleep is the ordinary outcome — the request finished
+            // first — and it means the deadline never elapsed, so returning
+            // without posting anything is exactly right.
             rio.sleep(.fromNanoseconds(ns), .awake) catch return;
             q.putOne(rio, .deadline) catch {};
         }
@@ -144,6 +175,9 @@ pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
     switch (event) {
         .done => {
             // The worker finished at the wire; its result stands, error or not.
+            // `group.cancel` above joined it, so the write is complete and
+            // visible without further synchronisation.
+            assert(task.result != null);
             return try task.result.?;
         },
         .deadline => {
@@ -169,6 +203,11 @@ test "https and garbage schemes are refused before any dial" {
     try t.expectError(error.TlsNotImplemented, fetch(io, .{ .url = "https://example.com/" }));
     try t.expectError(error.InvalidUrl, fetch(io, .{ .url = "gopher://example.com/" }));
     try t.expectError(error.InvalidUrl, fetch(io, .{ .url = "not a url" }));
+    // Every one of these is a string the caller was handed, so every one is an
+    // error. A leaf library that panics on a bad URL panics its consumer.
+    try t.expectError(error.InvalidUrl, fetch(io, .{ .url = "" }));
+    try t.expectError(error.InvalidUrl, fetch(io, .{ .url = "http://example.com:0/" }));
+    try t.expectError(error.InvalidUrl, fetch(io, .{ .url = "http:///nohost" }));
 }
 
 test "fetch against a live loopback server, deadline against a black hole" {
