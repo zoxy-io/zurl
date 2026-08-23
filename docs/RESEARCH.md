@@ -38,6 +38,26 @@ The incumbent, and what `bench/src/http.zig` v2 wraps today.
   forever on larger HTTPS payloads unless `write_buffer_size` is raised.
 * Ships TLS + certificate verification, redirects, a connection pool — the
   batteries a control plane wants and a parser bench does not.
+* **A URL can inject request headers.** Found while scoping zurl's own
+  equivalent hole, and worth reporting upstream. `std.Uri.parse` accepts CR and
+  LF inside a path and records the span as `Component.percent_encoded`;
+  `Component.formatPath` then writes that variant with a bare `writeAll`, no
+  validation and no re-encoding. So `parse` is permissive and `format` trusts
+  it, and the bytes reach the request line intact:
+
+  ```
+  std.Uri.parse("http://h/a\r\nX-Injected: 1")  ->  path = "/a\r\nX-Injected: 1"
+  ```
+
+  Measured for `parse` (Zig 0.16.0, run directly); the write side is by source
+  inspection of `Uri.zig` and `Client.zig:1001`, not executed end to end. The
+  `.raw` variant is safe — it goes through `percentEncode(w, raw, isPathChar)`
+  — so the defect is the asymmetry, not a missing encoder.
+
+  This matters twice over: it is the incumbent the harness uses today, so the
+  hole is already live there, and zurl's own version of it is therefore not a
+  regression the swap would introduce. docs/SCOPE.md schedules zurl's fix as
+  refusal rather than encoding.
 
 ### dusty — github.com/lalinsky/dusty
 

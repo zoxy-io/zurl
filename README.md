@@ -130,6 +130,11 @@ Two conclusions worth stating plainly:
         `authorization` stripped structurally (the harness carries a live IAM
         bearer token)
   - [ ] a default `user-agent` — zurl sends none, and some APIs reject that
+  - [ ] **refuse a target or host that cannot appear in a request line.** The
+        only item here that is broken in `main` rather than missing: nothing
+        validates them, and `std.Uri.parse` accepts CR/LF in a path and returns
+        it verbatim, so a URL can inject headers into zurl's request.
+        `std.http.Client` has the same hole (docs/RESEARCH.md)
 - [ ] point the zoxy benchmark's control plane at zurl and delete its std
       wrapper. Blocked on Tier 1: `std.http.Client` follows redirects silently
       today, so swapping in a client that does not would turn a followed 302

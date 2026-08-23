@@ -106,6 +106,50 @@ Several APIs require one (GitHub rejects UA-less requests outright), so its
 absence is a request that fails for a reason the caller cannot see in the
 status.
 
+### Refuse a target or host that cannot appear in a request line
+
+A security item, and the one thing on this list that is broken in `main` today
+rather than merely missing.
+
+`writeRequest` composes the request line by interpolation:
+
+```zig
+try out.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\n", .{ method, target, host });
+```
+
+Nothing validates `target` or `host` — there are two assertions that they are
+non-empty, and assertions are gone in the ReleaseFast build a consumer is free
+to choose. A target containing CR or LF therefore writes attacker-chosen bytes
+into the request line, which is header injection: everything after the CRLF is
+parsed by the origin as another header, or another request.
+
+**It is reachable through `fetch`, not only through `Connection`.** `fetch`
+runs the URL through `std.Uri.parse` first, which looks like validation and is
+not: `parse` accepts CR and LF in a path and hands them back verbatim in
+`Component.percent_encoded`, which `fetch` writes straight into the target.
+Measured, Zig 0.16.0:
+
+| input | `std.Uri.parse` | resulting path |
+|---|---|---|
+| `http://h/a b` | accepted | `/a b` — space, breaks the request line |
+| `http://h/a\r\nX-Injected: 1` | accepted | injects a header |
+| `http://h/a\nX: 1` | accepted | injects a header |
+
+So a consumer that forwards a URL it was handed — which is exactly what a leaf
+library invites — lets whoever chose that URL add headers to zurl's request.
+It is the same reasoning `client.zig` already applies to a bad URL being an
+error rather than an assertion: *a leaf library that panics on a bad URL panics
+its consumer*, and one that injects headers on a bad URL compromises its
+consumer.
+
+The fix is refusal, not encoding: zurl cannot re-encode a target without
+guessing whether a `?` the caller wrote is a query separator or a literal.
+Rejecting CR, LF, space and control characters in the target and host is
+unambiguous, cheap, and turns a silent request rewrite into an error.
+
+**`std.http.Client` has the same hole**, so this is not a regression the swap
+introduces — see docs/RESEARCH.md.
+
 ## Tier 2 — for remote API work generally
 
 * **Streaming request bodies.** `body` is `?[]const u8`, so `ycs.put` holds a
@@ -120,12 +164,17 @@ status.
   fresh-connection. `Connection` already does this; what is missing is a
   documented, bounded way to hold one open for an origin.
 * **Basic-auth helper** — base64 into a caller buffer, mostly for the CLI.
-* **Percent-encoding for URL building.** `ycs` interpolates bucket keys into
-  URLs with `{s}` and no escaping, which drafted as a Tier 1 latent bug — a key
-  containing a space, `?` or `#` would silently change the request target.
-  **Checked: those keys are URL-safe**, so nothing is broken today and this is
-  defence against a future key rather than a fix. Demoted on that evidence,
-  which is the only reason it moved.
+* **Percent-encoding for URL building.** The ergonomic half of the refusal item
+  in Tier 1: refusing a bad target tells a caller it built a wrong URL, and an
+  encoder is how it builds a right one. Writes into a caller buffer.
+
+  It sits here rather than in Tier 1 only because of *who* builds the URL.
+  `ycs` interpolates bucket keys with `{s}` and no escaping, and those keys are
+  URL-safe **today** — checked — so nothing is broken now. That safety is a
+  property of the keys currently in use, not something anything enforces, so
+  this is scheduled rather than dismissed: the day a key carries a space or a
+  `#`, the Tier 1 refusal turns it into a loud error and this turns it back
+  into a working request.
 
 ### Retry is the caller's, and zurl only supplies the ingredients
 
