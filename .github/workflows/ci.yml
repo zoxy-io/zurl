@@ -1,0 +1,57 @@
+# The gates CLAUDE.md already requires of every slice, run where they
+# cannot be skipped. Deliberately NOT here: benchmarks (rule 8 compares bands
+# on one box in one session, and a shared runner is not a control) and
+# `tls-smoke`, which needs a live origin — see the manual job at the bottom.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Zig 0.16.0 exactly. std.Io moves, so master and 0.15 are both wrong;
+      # build.zig.zon's minimum_zig_version is the single source of that pin
+      # and setup-zig reads it when `version` is left empty.
+      - uses: mlugg/setup-zig@v2
+
+      - name: zig fmt --check
+        run: zig fmt --check src bench smoke build.zig build.zig.zon
+
+      - name: zig build check
+        run: zig build check --summary all
+
+      - name: zig build test
+        run: zig build test --summary all
+
+      # Redundant with `test` (the oracles are tests), but kept separate so a
+      # parser regression names itself as a segmentation-invariance failure
+      # rather than as one line in a 28-test summary.
+      - name: zig build fuzz
+        run: zig build fuzz --summary all
+
+  # The live TLS gate. Manual only: a gate that fails when DNS is down is a
+  # gate people learn to ignore, so it never blocks a PR.
+  tls-smoke:
+    name: tls-smoke (live)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+      - name: zig build tls-smoke
+        run: zig build tls-smoke

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 const parser = @import("parser.zig");
 const LineSink = @import("sink.zig").LineSink;
 
@@ -46,6 +47,11 @@ pub const Response = struct {
     body_len: u64,
 
     pub fn ok(r: Response) bool {
+        // A Response only ever comes from a round trip, which range-checked
+        // the status — the same precondition `Head.bodyless` states.
+        assert(r.status >= 100);
+        assert(r.status <= 999);
+
         return r.status == 200;
     }
 };
@@ -65,6 +71,23 @@ pub const Connection = struct {
     reusable: bool = true,
 
     pub fn init(in: *Io.Reader, out: *Io.Writer) Connection {
+        // The reader's buffer is a real bound — it limits the longest head
+        // line the parser can ever see, and a zero-length one fails every
+        // response for a reason that has nothing to do with the response.
+        assert(in.buffer.len > 0);
+        // `out` gets no length assertion: zero means "unbuffered", which is a
+        // legitimate choice, and the TLS transport's writer is exactly that.
+        // An earlier assertion here forbade it — a claim about what had not
+        // happened yet rather than about what cannot.
+        //
+        // What IS still an invariant is the thing that actually broke. std
+        // documents a zero-length buffer as making the DEFAULT flush a no-op,
+        // so an unbuffered writer that kept it would silently swallow
+        // `writeRequest`'s closing flush and the request would never reach the
+        // wire — which is precisely how the TLS transport first failed, as an
+        // UnexpectedEof out of the parser.
+        if (out.buffer.len == 0) assert(out.vtable.flush != Io.Writer.defaultFlush);
+
         return .{ .in = in, .out = out };
     }
 
@@ -72,7 +95,12 @@ pub const Connection = struct {
     /// and delivered to `sink`, and `reusable` is updated from what the
     /// exchange actually was — not from what the request asked for.
     pub fn roundTrip(c: *Connection, req: Request, sink: Sink, opts: parser.HeadOptions) Error!Response {
+        assert(req.host.len > 0);
+        assert(req.target.len > 0);
+
         if (!c.reusable) return error.ConnectionNotReusable;
+        // Any error leaves the stream at an offset nobody knows, so no further
+        // request can be framed on this transport.
         errdefer c.reusable = false;
 
         try writeRequest(c.out, req);
@@ -90,7 +118,12 @@ pub const Connection = struct {
         const body = try parser.streamBody(c.in, head, req.method, w, opts);
         if (sink == .lines) sink.lines.finish();
 
+        // Reuse is the exchange's verdict, never the request's wish: asking for
+        // keep-alive cannot make a close-delimited body reusable.
         c.reusable = body.keep_alive and req.keep_alive;
+        // streamBody's postcondition, checked where it is relied on.
+        if (head.bodyless(req.method)) assert(body.len == 0);
+
         return .{ .status = head.status, .body_len = body.len };
     }
 
@@ -99,7 +132,12 @@ pub const Connection = struct {
     /// the unread body is still on the wire — which is exactly the contract a
     /// warm probe wants (it closes the transport regardless).
     pub fn roundTripHead(c: *Connection, req: Request, opts: parser.HeadOptions) Error!parser.Head {
+        assert(req.host.len > 0);
+        assert(req.target.len > 0);
+
         if (!c.reusable) return error.ConnectionNotReusable;
+        // The body is deliberately left on the wire, so nothing downstream can
+        // know where the next response would begin.
         c.reusable = false;
         try writeRequest(c.out, req);
         return parser.parseHead(c.in, opts);
@@ -107,6 +145,12 @@ pub const Connection = struct {
 };
 
 pub fn writeRequest(out: *Io.Writer, req: Request) Io.Writer.Error!void {
+    // HTTP/1.1 makes Host mandatory, and an empty origin-form target is not a
+    // request line any origin will answer. Both are ours to get right, so both
+    // are assertions rather than errors.
+    assert(req.host.len > 0);
+    assert(req.target.len > 0);
+
     try out.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\n", .{
         @tagName(req.method), req.target, req.host,
     });
@@ -130,8 +174,6 @@ test "round trips over an in-memory transport, keep-alive bookkeeping included" 
     // no Io implementation, same code path as production.
     const wire = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi" ++
         "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok";
-    var rbuf: [128]u8 = undefined;
-    _ = &rbuf;
     var in: Io.Reader = .fixed(wire);
     var out_buf: [1024]u8 = undefined;
     var out: Io.Writer = .fixed(&out_buf);

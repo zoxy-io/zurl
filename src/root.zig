@@ -14,7 +14,8 @@
 //! Layers, bottom up:
 //!   `parser`     — head + framed body delivery; zero-allocation
 //!   `Connection` — request/response exchanges over an injected transport
-//!   `fetch`      — URL in, deadline-bounded response out (plain HTTP in v0)
+//!   `tls`        — std.crypto.tls spliced into the transport, nothing more
+//!   `fetch`      — URL in, deadline-bounded response out (http and https)
 
 const std = @import("std");
 
@@ -32,6 +33,8 @@ pub const Sink = conn_mod.Sink;
 pub const Header = conn_mod.Header;
 pub const writeRequest = conn_mod.writeRequest;
 
+pub const tls = @import("tls.zig");
+
 const client = @import("client.zig");
 pub const fetch = client.fetch;
 pub const FetchRequest = client.FetchRequest;
@@ -39,4 +42,7 @@ pub const default_deadline_ns = client.default_deadline_ns;
 
 test {
     std.testing.refAllDecls(@This());
+    // Not exported: test and fuzz infrastructure, reachable only so that
+    // `zig build test` runs the fuzz oracle over its seed corpus.
+    _ = @import("fuzz.zig");
 }

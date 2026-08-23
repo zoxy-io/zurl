@@ -31,6 +31,13 @@ applies the bodyless rules unconditionally, and — RFC 9112 §6.3 again —
 conflicting duplicate Content-Length values, because that disagreement is the
 request-smuggling primitive.
 
+One strictness decision, one place. A trailer is a header field (RFC 9112
+§7.1.2) and is held to the head's rule: the fuzzer found the trailer section
+delivering a nameless field the head refuses, so the same bytes meant two
+different things depending on where in the message they appeared. Validation
+that lives in a callback branch is worse still — it makes the parse depend on
+whether the caller happened to be listening.
+
 ## 3. The deadline is whole-request, and it comes from Io cancellation
 
 Nightly run #9 burned 71 minutes inside one unbounded poll. The first fix
@@ -98,6 +105,10 @@ loop of a load generator may simply never be the right consumer.
 ## Non-goals (v0)
 
 HTTP/2 (nothing in either repo speaks it as a client), redirects, cookies,
-connection pools, request-side chunked bodies, TLS *in-tree* (rule 5 gives it
-a seam; a `std.crypto.tls` transport adapter is the obvious v1 item, and
-`fetch` returns `error.TlsNotImplemented` for https until then).
+connection pools, request-side chunked bodies.
+
+TLS is no longer among them, and the way it landed is the rule working:
+`src/tls.zig` is an adapter that turns one `*Io.Reader`/`*Io.Writer` pair into
+another, `Connection` is unchanged, and a consumer that prefers zrk's ztls
+still hands `Connection` its own two pointers and never compiles the file.
+The trust anchors stay the caller's — loading them allocates.
