@@ -80,7 +80,11 @@ pub const HeadOptions = struct {
     ctx: ?*anyopaque = null,
     /// Budget for the status line plus all headers (and, separately reused,
     /// all trailers), counted in raw bytes including line endings.
-    max_head_bytes: usize = 64 * 1024,
+    max_head_bytes: usize = max_head_bytes_default,
+
+    /// One constant so `client.FetchRequest` can default to the same bound
+    /// without restating the number.
+    pub const max_head_bytes_default: usize = 64 * 1024;
 };
 
 pub const Body = struct {

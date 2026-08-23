@@ -12,6 +12,7 @@ const Io = std.Io;
 const assert = std.debug.assert;
 const net = std.Io.net;
 const connection = @import("connection.zig");
+const parser = @import("parser.zig");
 const tls_transport = @import("tls.zig");
 
 pub const default_deadline_ns: u64 = 30 * std.time.ns_per_s;
@@ -26,6 +27,41 @@ pub const FetchRequest = struct {
     extra: []const connection.Header = &.{},
     body: ?[]const u8 = null,
     sink: connection.Sink = .discard,
+    /// Called once per RESPONSE header, and again for each chunked trailer.
+    /// Names arrive as the origin sent them; values are trimmed of leading and
+    /// trailing space and tab.
+    ///
+    /// This is the only way to see a response header, and it is a callback
+    /// rather than a map because of where the bytes live: `name` and `value`
+    /// point into the reader's buffer, which the body stream overwrites. They
+    /// are valid **for the duration of the call and no longer**, so a caller
+    /// that wants one keeps it by copying it out. That constraint is the API
+    /// rather than a wart — a map would have to allocate, and zurl does not.
+    ///
+    /// It fires while the head is being read, so it cannot be used to decide
+    /// whether to send the request; for that, look at `Response.status` after.
+    ///
+    /// **A trailer can repeat a name the head already sent, and this callback
+    /// cannot tell you which is which.** A caller that stores last-value-wins
+    /// therefore lets the trailer overwrite the head — so an origin can answer
+    /// `retry-after: 60` in the head and `retry-after: 0` in the trailer and
+    /// defeat the backoff the header exists for. A check a caller ran against
+    /// the head does not re-run against the trailer. If a value is
+    /// load-bearing, keep the FIRST occurrence, or stop recording once the
+    /// body starts.
+    on_header: ?parser.HeaderFn = null,
+    /// Passed to `on_header` untouched. It is where a caller keeps whatever it
+    /// copied out during the callback.
+    ctx: ?*anyopaque = null,
+    /// Bounds the status line plus all headers, and separately the trailer
+    /// section, in raw bytes. Exposed alongside `on_header` because the two
+    /// are one decision: a caller reading rate-limit headers off a chatty API
+    /// is exactly the caller who may need this raised, and an omitted bound is
+    /// an accident waiting to be reinterpreted.
+    ///
+    /// The head must also fit whole in the transport's read buffer, so the
+    /// smaller of the two wins.
+    max_head_bytes: usize = parser.HeadOptions.max_head_bytes_default,
     deadline_ns: u64 = default_deadline_ns,
     /// Named in the timeout message. A key or a short label, never a URL — a
     /// URL can carry a token in its query, and logs are public.
@@ -170,6 +206,22 @@ const Task = struct {
         return task.exchangePlain(&stream, host, target);
     }
 
+    /// What the parser is told about the head, built once so the two
+    /// transports cannot drift apart in what they observe.
+    fn headOptions(task: *Task) parser.HeadOptions {
+        // Programmer input, not wire input, so an assertion is right where a
+        // URL gets an error: every parser entry point asserts this, and
+        // catching it at the boundary that BUILDS the options names the
+        // misconfigured FetchRequest instead of a frame deep in the parser.
+        assert(task.req.max_head_bytes > 0);
+
+        return .{
+            .on_header = task.req.on_header,
+            .ctx = task.req.ctx,
+            .max_head_bytes = task.req.max_head_bytes,
+        };
+    }
+
     /// The request every exchange sends, built once so the two transports
     /// cannot drift apart in what they ask for.
     fn request(task: *Task, host: []const u8, target: []const u8) connection.Request {
@@ -208,7 +260,7 @@ const Task = struct {
         var w = stream.writer(io, &write_buffer);
 
         var conn = connection.Connection.init(&r.interface, &w.interface);
-        return conn.roundTrip(task.request(host, target), task.req.sink, .{});
+        return conn.roundTrip(task.request(host, target), task.req.sink, task.headOptions());
     }
 
     /// The same exchange with a TLS session spliced into the transport, which
@@ -258,7 +310,7 @@ const Task = struct {
         defer transport.close();
 
         var conn = connection.Connection.init(transport.reader(), transport.writer());
-        return conn.roundTrip(task.request(host, target), task.req.sink, .{});
+        return conn.roundTrip(task.request(host, target), task.req.sink, task.headOptions());
     }
 };
 
@@ -361,6 +413,49 @@ pub fn fetch(io: Io, req: FetchRequest) Error!?connection.Response {
 // ---------------------------------------------------------------------------
 // tests
 const t = std.testing;
+
+/// Accept one connection, read until the blank line, write `response`.
+///
+/// Spawned with `Group.concurrent`, never `async`: `Io.Threaded` runs an
+/// `async` task inline once its limit is reached, and an origin running inline
+/// deadlocks the client that is waiting for it.
+fn serveOnce(srv: *net.Server, sio: Io, response: []const u8) void {
+    var s = srv.accept(sio) catch return;
+    defer s.close(sio);
+
+    var rb: [2048]u8 = undefined;
+    var rr = s.reader(sio, &rb);
+    // lint:unbounded-ok — the client sends a finite head and then waits; a
+    // peer that never sends the blank line fails the read and returns.
+    while (true) {
+        const line = rr.interface.takeDelimiterInclusive('\n') catch return;
+        if (line.len <= 2) break;
+    }
+
+    var wb: [512]u8 = undefined;
+    var ww = s.writer(sio, &wb);
+    ww.interface.writeAll(response) catch return;
+    ww.interface.flush() catch return;
+}
+
+/// Records the header callback sequence, copying out of the reader's buffer
+/// because those slices die when the body stream reuses it.
+const HeaderLog = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    retry_after: ?u32 = null,
+
+    fn onHeader(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+        const self: *HeaderLog = @ptrCast(@alignCast(ctx.?));
+        // Benign swallow: an overflow just stops `len` growing, and the
+        // exact-match assertion in the test then fails loudly on the shortfall.
+        const w = std.fmt.bufPrint(self.buf[self.len..], "{s}={s};", .{ name, value }) catch return;
+        self.len += w.len;
+        if (std.ascii.eqlIgnoreCase(name, "retry-after")) {
+            self.retry_after = std.fmt.parseInt(u32, value, 10) catch null;
+        }
+    }
+};
 
 test "an https url without trust configuration is refused before any dial" {
     var threaded: Io.Threaded = .init(t.allocator, .{});
@@ -516,4 +611,84 @@ test "a URL that would inject request headers is refused before any dial" {
             .what = "poisoned url",
         }));
     }
+}
+
+test "response headers and trailers reach the caller through fetch" {
+    // The motivating case end to end: a 429 whose `retry-after` says how long
+    // to wait. `Response` is {status, body_len}, so before this no response
+    // header was observable from `fetch` at all and a caller had to guess its
+    // backoff — which is what the benchmark's Discord poster still does.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    // Chunked, so the trailer section is exercised: trailers arrive on the
+    // SAME callback, which is the thing a caller can mis-attribute.
+    const response = "HTTP/1.1 429 Too Many Requests\r\n" ++
+        "retry-after:   7   \r\n" ++
+        "x-ratelimit-remaining: 0\r\n" ++
+        "transfer-encoding: chunked\r\n\r\n" ++
+        "2\r\nhi\r\n0\r\nx-trailer: late\r\n\r\n";
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveOnce, .{ &server, io, response });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{port});
+
+    var log: HeaderLog = .{};
+    var body: Io.Writer.Allocating = .init(t.allocator);
+    defer body.deinit();
+    const res = (try fetch(io, .{
+        .url = url,
+        .sink = .{ .collect = &body },
+        .on_header = HeaderLog.onHeader,
+        .ctx = &log,
+    })).?;
+
+    try t.expectEqual(@as(u16, 429), res.status);
+    try t.expectEqualStrings("hi", body.written());
+    // Trimmed, so a caller never re-implements OWS handling.
+    try t.expectEqual(@as(?u32, 7), log.retry_after);
+    // Order preserved, and the trailer arrives on the same channel, last.
+    try t.expectEqualStrings(
+        "retry-after=7;x-ratelimit-remaining=0;transfer-encoding=chunked;x-trailer=late;",
+        log.buf[0..log.len],
+    );
+}
+
+test "max_head_bytes is the caller's, and refuses a head that outgrows it" {
+    // The bound travels with `on_header` because they are one decision: the
+    // caller who reads headers off a chatty API is the one who may need it
+    // raised. A budget below the head must refuse rather than truncate
+    // (rule 7) — and it must be the BUDGET that refuses, so the head here is
+    // far smaller than the transport's read buffer.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-pad: " ++ ("p" ** 200) ++ "\r\n\r\nhi";
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveOnce, .{ &server, io, response });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{port});
+
+    try t.expectError(error.HeadTooLong, fetch(io, .{
+        .url = url,
+        .max_head_bytes = 64,
+    }));
 }

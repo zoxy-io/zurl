@@ -52,7 +52,11 @@ header-injection hole ahead of four features. Nothing else moved.
 
 ### Refuse a target or host that cannot appear in a request line
 
-A security item, and the one thing on this list that is broken in `main` today
+**Landed** (`5444aef`), and wider than written here: `writeRequest` interpolates
+`authorization`, `content_type` and every `extra` header too, so validation
+covers every interpolated field rather than the two named below.
+
+A security item, and the one thing on this list that was broken in `main`
 rather than merely missing.
 
 `writeRequest` composes the request line by interpolation:
@@ -96,7 +100,11 @@ introduces — see docs/RESEARCH.md.
 
 ### Response headers must be reachable from `fetch`
 
-`Response` is `{status, body_len}`. `parser.HeadOptions` has always had
+**Landed.** `FetchRequest.on_header` and `ctx` pass straight through to the
+parser, so headers and chunked trailers arrive on one callback, in order, with
+values already trimmed.
+
+`Response` was `{status, body_len}`. `parser.HeadOptions` has always had
 `on_header`; `fetch` simply never passed it through, so from the top-level API
 no response header is observable at all.
 

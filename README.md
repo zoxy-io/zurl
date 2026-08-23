@@ -68,6 +68,28 @@ var carry: [8 * 1024]u8 = undefined;
 var sink = zurl.LineSink.init(&buf, &carry, &ctx, onLine);
 ```
 
+### Reading response headers
+
+One callback, fired per header and again per chunked trailer, in order, with
+values already trimmed. `name` and `value` point into the reader's buffer and
+the body is about to overwrite them — **copy what you want to keep.** A map
+would have to allocate, and zurl does not.
+
+```zig
+fn onHeader(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+    const wait: *?u32 = @ptrCast(@alignCast(ctx.?));
+    if (std.ascii.eqlIgnoreCase(name, "retry-after"))
+        wait.* = std.fmt.parseInt(u32, value, 10) catch null;
+}
+
+var retry_after: ?u32 = null;
+const res = try zurl.fetch(io, .{
+    .url = url,
+    .on_header = onHeader,
+    .ctx = &retry_after,
+}) orelse return error.TimedOut;
+```
+
 ### https
 
 Trust anchors are **yours**. There is no default, on purpose: loading a store
@@ -114,10 +136,11 @@ Works identically on `Io.Threaded` and zio — both are production backends for
 its consumers, so a mechanism that only works on one is not a mechanism zurl
 uses.
 
-**Not yet:** response headers are not reachable from `fetch`, redirects are not
-followed, and no `user-agent` is sent. [docs/SCOPE.md](docs/SCOPE.md) is the
-list, in the order it will be built, and says what is deliberately refused
-(HTTP/2, cookies, connection pools, signing schemes).
+**Not yet:** redirects are not followed, a `content-encoding` zurl does not
+understand is not yet refused, and no `user-agent` is sent.
+[docs/SCOPE.md](docs/SCOPE.md) is the list, in the order it will be built, and
+says what is deliberately refused (HTTP/2, cookies, connection pools, signing
+schemes).
 
 ## Numbers
 
