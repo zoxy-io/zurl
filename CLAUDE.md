@@ -26,7 +26,10 @@ For every slice, in order:
 1. **Write it**, with its tests, under docs/TIGER_STYLE.md.
 2. **`zig build test`** — must be green. New behaviour arrives with new tests;
    anything that reads the wire arrives with a segmentation-invariance test
-   (rule 4).
+   (rule 4). This includes the fuzz oracle; `zig build fuzz` runs that alone,
+   in 0.15 s, when the parser is what you are editing.
+   A new framing shape gets a line in `src/fuzz.zig`'s seed corpus — the
+   mutator can only reach what the seeds spell.
 3. **`zig fmt --check src bench build.zig build.zig.zon`** — must be clean.
 4. **Benchmarks.** `zig build bench-parse -Doptimize=ReleaseFast` for anything
    touching `src/parser.zig` or `src/sink.zig`; `bench-e2e` as well for

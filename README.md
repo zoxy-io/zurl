@@ -20,7 +20,8 @@ Private while it is an experiment. Zig 0.16.0, zero dependencies.
 ```
 parser      head + framed body → sink; zero-allocation; owns ALL framing
             (content-length / chunked+trailers / close-delimited, bodyless
-            statuses, TE-beats-CL, conflicting CL refused)
+            statuses, TE-beats-CL, conflicting CL refused); fuzzed against
+            segmentation invariance
 Connection  request/response over an injected *Io.Reader + *Io.Writer —
             plain TCP, std TLS, zrk's ztls, or a fixed buffer in a test
 fetch       URL in, deadline-bounded Response out; the deadline is a race
@@ -89,4 +90,19 @@ Two conclusions worth stating plainly:
 - [ ] TLS transport adapter over `std.crypto.tls` (then: point the zoxy
       benchmark's control plane at zurl and delete its std wrapper)
 - [ ] zio-backend run of bench-e2e (numbers above are `Io.Threaded`)
-- [ ] fuzz the parser (the SegmentedReader harness is fuzz-shaped already)
+- [x] fuzz the parser — `zig build fuzz`, with design rule 4 as the oracle.
+      The same bytes parsed whole, at a split, and one byte per read must give
+      one answer on every channel a caller can observe: the verdict and body
+      bytes, the header/trailer callback sequence (whose slices live in the
+      reader's buffer — the memory segmentation actually changes), and the
+      offset the parse left the stream at, because two parses can agree on
+      every body byte and still frame the connection differently. Every seed
+      shape at every split position plus 20 k mutations run per slice, in
+      0.15 s. It earned its keep immediately: the first run with the header
+      channel enabled found the trailer section accepting a field the head
+      refuses (`0\r\n: v\r\n\r\n`) — the same bytes meaning two different
+      things depending on where in the message they appeared. Fixed, with the
+      shape now a seed; 3 M further mutations across six seeds found nothing.
+      Zig 0.16.0's coverage-guided `--fuzz` does not build (a toolchain bug in
+      its own bundled `test_runner.zig:566`), so the mutator is in-tree and
+      seeded.

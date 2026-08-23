@@ -220,19 +220,8 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
             return error.MalformedChunk;
 
         if (size == 0) {
-            // Trailers: header lines until a blank line, delivered through the
-            // same callback as headers, under a fresh head-sized budget.
-            var budget = opts.max_head_bytes;
-            // lint:unbounded-ok — the head's bound exactly: takeLine charges
-            // every trailer line against `budget` and fails when it is spent.
-            while (true) {
-                const line = takeLine(r, &budget) catch return error.MalformedChunk;
-                if (line.len == 0) return total;
-                if (opts.on_header) |f| {
-                    const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-                    f(opts.ctx, line[0..colon], std.mem.trim(u8, line[colon + 1 ..], " \t"));
-                }
-            }
+            try streamTrailers(r, opts);
+            return total;
         }
 
         // The zero-size chunk returned above, so every pass reaching here moves
@@ -252,6 +241,42 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
         var crlf_budget: usize = 8;
         const crlf = takeLine(r, &crlf_budget) catch return error.MalformedChunk;
         if (crlf.len != 0) return error.MalformedChunk;
+    }
+}
+
+/// The trailer section: header fields until the blank line, delivered through
+/// the same callback as the head's, under a fresh head-sized budget.
+///
+/// A trailer IS a header field (RFC 9112 §7.1.2), so it is held to the head's
+/// rule AND reports the head's errors — a nameless field is
+/// `error.MalformedHeader` here exactly as it is there, an over-long line is
+/// `error.HeadTooLong` (which is what that error's own doc has always
+/// claimed), and a truncated section is `error.UnexpectedEof` rather than a
+/// vaguer complaint about chunk framing. One position-independent answer.
+///
+/// The fuzzer found both halves of the old behaviour: this section delivered
+/// a nameless field that `parseHead` refuses, so the same bytes meant two
+/// different things depending on where in the message they appeared; and the
+/// validation sat inside the `on_header` branch, so whether a line was
+/// inspected at all depended on whether the caller had installed a listener.
+fn streamTrailers(r: *Io.Reader, opts: HeadOptions) Error!void {
+    assert(opts.max_head_bytes > 0);
+
+    var budget = opts.max_head_bytes;
+    // lint:unbounded-ok — the head's bound exactly: takeLine charges every
+    // trailer line against `budget` and fails when it is spent.
+    while (true) {
+        const line = try takeLine(r, &budget);
+        assert(budget < opts.max_head_bytes);
+        if (line.len == 0) return;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
+        const name = line[0..colon];
+        if (name.len == 0) return error.MalformedHeader;
+
+        if (opts.on_header) |f| {
+            f(opts.ctx, name, std.mem.trim(u8, line[colon + 1 ..], " \t"));
+        }
     }
 }
 
@@ -299,45 +324,7 @@ fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
 // tests
 
 const t = std.testing;
-
-/// Serves a canned byte stream in caller-chosen segments: `stream` never
-/// crosses the next boundary, so the parser sees the same bytes under every
-/// possible transport segmentation. This is the harness behind design rule 4.
-const SegmentedReader = struct {
-    data: []const u8,
-    pos: usize = 0,
-    /// Serve at most this many bytes per `stream` call.
-    max_seg: usize,
-    /// Additionally never cross this absolute offset (a single "packet
-    /// boundary"); 0 disables.
-    boundary: usize = 0,
-    interface: Io.Reader,
-
-    fn init(data: []const u8, max_seg: usize, boundary: usize, buffer: []u8) SegmentedReader {
-        return .{
-            .data = data,
-            .max_seg = max_seg,
-            .boundary = boundary,
-            .interface = .{
-                .vtable = &.{ .stream = stream },
-                .buffer = buffer,
-                .seek = 0,
-                .end = 0,
-            },
-        };
-    }
-
-    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        const s: *SegmentedReader = @alignCast(@fieldParentPtr("interface", r));
-        if (s.pos >= s.data.len) return error.EndOfStream;
-        var n = limit.minInt(@min(s.max_seg, s.data.len - s.pos));
-        if (s.boundary > s.pos and s.boundary < s.pos + n) n = s.boundary - s.pos;
-        if (n == 0) return error.EndOfStream;
-        try w.writeAll(s.data[s.pos..][0..n]);
-        s.pos += n;
-        return n;
-    }
-};
+const SegmentedReader = @import("SegmentedReader.zig");
 
 fn parseAll(reader: *Io.Reader, method: std.http.Method, out: *Io.Writer.Allocating) !struct { Head, Body } {
     const head = try parseHead(reader, .{});
@@ -348,7 +335,7 @@ fn parseAll(reader: *Io.Reader, method: std.http.Method, out: *Io.Writer.Allocat
 test "content-length body, plain" {
     const wire = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var sr = SegmentedReader.init(wire, wire.len, null, &buf);
     var out: Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     const head, const body = try parseAll(&sr.interface, .GET, &out);
@@ -362,7 +349,7 @@ test "chunked body reassembles across chunk boundaries, with trailers" {
     const wire = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n" ++
         "4\r\nWiki\r\n5\r\npedia\r\n0\r\nx-trailer: yes\r\n\r\n";
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var sr = SegmentedReader.init(wire, wire.len, null, &buf);
     var out: Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     const head, const body = try parseAll(&sr.interface, .GET, &out);
@@ -394,7 +381,7 @@ test "segmentation invariance: every split point and byte-at-a-time" {
 
     // One byte per read — every boundary at once.
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire, 1, 0, &buf);
+    var sr = SegmentedReader.init(wire, 1, null, &buf);
     var out: Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     _, const body = try parseAll(&sr.interface, .GET, &out);
@@ -406,7 +393,7 @@ test "bodyless: 204 with keep-alive does not hang, and HEAD ignores content-leng
     // ziglang/zig#25181 is exactly this shape hanging in std.http.Client.
     const wire204 = "HTTP/1.1 204 No Content\r\n\r\n" ++ "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire204, wire204.len, 0, &buf);
+    var sr = SegmentedReader.init(wire204, wire204.len, null, &buf);
     var out: Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
 
@@ -420,7 +407,7 @@ test "bodyless: 204 with keep-alive does not hang, and HEAD ignores content-leng
     try t.expectEqual(@as(u64, 2), b2.len);
 
     const head_wire = "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n";
-    var sr2 = SegmentedReader.init(head_wire, head_wire.len, 0, &buf);
+    var sr2 = SegmentedReader.init(head_wire, head_wire.len, null, &buf);
     var out2: Io.Writer.Allocating = .init(t.allocator);
     defer out2.deinit();
     _, const hb = try parseAll(&sr2.interface, .HEAD, &out2);
@@ -431,14 +418,14 @@ test "transfer-encoding beats content-length; conflicting lengths are refused" {
     const smuggle = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n" ++
         "2\r\nab\r\n0\r\n\r\n";
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(smuggle, smuggle.len, 0, &buf);
+    var sr = SegmentedReader.init(smuggle, smuggle.len, null, &buf);
     var out: Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     _, const body = try parseAll(&sr.interface, .GET, &out);
     try t.expectEqualStrings("ab", out.written()); // chunked won; CL ignored
 
     const conflict = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ncontent-length: 5\r\n\r\n";
-    var sr2 = SegmentedReader.init(conflict, conflict.len, 0, &buf);
+    var sr2 = SegmentedReader.init(conflict, conflict.len, null, &buf);
     try t.expectError(error.MalformedHeader, parseHead(&sr2.interface, .{}));
     _ = body;
 }
@@ -446,13 +433,47 @@ test "transfer-encoding beats content-length; conflicting lengths are refused" {
 test "close-delimited body forces keep_alive false" {
     const wire = "HTTP/1.0 200 OK\r\n\r\nrest of stream";
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var sr = SegmentedReader.init(wire, wire.len, null, &buf);
     var out: Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     const head, const body = try parseAll(&sr.interface, .GET, &out);
     try t.expect(!head.http11);
     try t.expect(!body.keep_alive);
     try t.expectEqualStrings("rest of stream", out.written());
+}
+
+test "a trailer is held to the head's rule, listener or no listener" {
+    // Found by src/fuzz.zig: the head refuses a nameless field, and the
+    // trailer section used to deliver one. The same bytes must not mean two
+    // different things depending on where in the message they appear.
+    const nameless = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n: v\r\n\r\n";
+    const colonless = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\ngarbage\r\n\r\n";
+    const head_nameless = "HTTP/1.1 200 OK\r\n: v\r\n\r\n";
+
+    var buf: [256]u8 = undefined;
+    var head_reader = SegmentedReader.init(head_nameless, head_nameless.len, null, &buf);
+    try t.expectError(error.MalformedHeader, parseHead(&head_reader.interface, .{}));
+
+    // And the verdict does not depend on whether anyone is listening: the
+    // callback used to be where the check lived.
+    const Sink = struct {
+        fn ignore(_: ?*anyopaque, _: []const u8, _: []const u8) void {}
+    };
+    for ([_][]const u8{ nameless, colonless }) |wire| {
+        for ([_]?HeaderFn{ null, Sink.ignore }) |listener| {
+            var sr = SegmentedReader.init(wire, wire.len, null, &buf);
+            var out: Io.Writer.Allocating = .init(t.allocator);
+            defer out.deinit();
+            const opts: HeadOptions = .{ .on_header = listener };
+            const head = try parseHead(&sr.interface, opts);
+            // The head's error, not a vaguer one about chunk framing: the
+            // whole point is that position does not change the answer.
+            try t.expectError(
+                error.MalformedHeader,
+                streamBody(&sr.interface, head, .GET, &out.writer, opts),
+            );
+        }
+    }
 }
 
 test "connection tokens match whole tokens, not substrings" {
@@ -469,7 +490,7 @@ test "head budget terminates an endless-header server" {
     w.writeAll("HTTP/1.1 200 OK\r\n") catch unreachable;
     for (0..100) |_| w.writeAll("x-h: aaaaaaaaaaaaaaaaaaaaaaaaaa\r\n") catch unreachable;
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(w.buffered(), wire.len, 0, &buf);
+    var sr = SegmentedReader.init(w.buffered(), wire.len, null, &buf);
     try t.expectError(error.HeadTooLong, parseHead(&sr.interface, .{ .max_head_bytes = 512 }));
 }
 
@@ -486,7 +507,7 @@ test "headers are delivered through the callback with trimmed values" {
     };
     const wire = "HTTP/1.1 200 OK\r\nx-spaced:   v  \r\ncontent-length: 0\r\n\r\n";
     var buf: [256]u8 = undefined;
-    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var sr = SegmentedReader.init(wire, wire.len, null, &buf);
     var ctx: Ctx = .{};
     _ = try parseHead(&sr.interface, .{ .on_header = Ctx.on, .ctx = &ctx });
     try t.expectEqual(@as(usize, 1), ctx.seen);

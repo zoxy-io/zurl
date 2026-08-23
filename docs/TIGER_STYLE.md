@@ -189,7 +189,9 @@ test must be.
 - **Anything that reads the wire ships a segmentation-invariance test**
   (rule 4). Parse the same bytes at **every** two-segment split position and
   byte-at-a-time, and require the identical event sequence every time.
-  `SegmentedReader` in `src/parser.zig` is the harness. A feature that only
+  `src/SegmentedReader.zig` is the harness and `src/fuzz.zig` is the oracle
+  that drives it over a seed corpus and a mutation loop; a new framing shape
+  gets a corpus seed there. A feature that only
   has a happy-path test where the whole response arrives at once is not
   tested; that is precisely the bug that read chunked bodies as plain text for
   months.

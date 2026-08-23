@@ -31,6 +31,13 @@ applies the bodyless rules unconditionally, and — RFC 9112 §6.3 again —
 conflicting duplicate Content-Length values, because that disagreement is the
 request-smuggling primitive.
 
+One strictness decision, one place. A trailer is a header field (RFC 9112
+§7.1.2) and is held to the head's rule: the fuzzer found the trailer section
+delivering a nameless field the head refuses, so the same bytes meant two
+different things depending on where in the message they appeared. Validation
+that lives in a callback branch is worse still — it makes the parse depend on
+whether the caller happened to be listening.
+
 ## 3. The deadline is whole-request, and it comes from Io cancellation
 
 Nightly run #9 burned 71 minutes inside one unbounded poll. The first fix

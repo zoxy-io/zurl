@@ -39,4 +39,7 @@ pub const default_deadline_ns = client.default_deadline_ns;
 
 test {
     std.testing.refAllDecls(@This());
+    // Not exported: test and fuzz infrastructure, reachable only so that
+    // `zig build test` runs the fuzz oracle over its seed corpus.
+    _ = @import("fuzz.zig");
 }
