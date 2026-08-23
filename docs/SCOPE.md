@@ -40,6 +40,12 @@ that is a defect report against the library, not a shortcut to take.
 
 ## Tier 1 — required before the harness swap is safe
 
+**In this order.** It is risk order, not convenience order, and it is settled:
+an item is not promoted because it happens to be small. `content-encoding` in
+particular is a live silent-corruption path and a few lines to close, which is
+an argument for doing it *well*, not for doing it *first* — the header gap
+above it is what makes the other three verifiable at all.
+
 ### Response headers must be reachable from `fetch`
 
 `Response` is `{status, body_len}`. `parser.HeadOptions` has always had
@@ -92,18 +98,13 @@ Three things are structural, never flags:
 * **The chain is bounded** by a caller-supplied URL buffer and a max count,
   like every other bound here.
 
-### A default `user-agent`, and percent-encoding for URL building
+### A default `user-agent`
 
 zurl sends `host`, and optionally `authorization`, `content-type`,
 `content-length`, `connection` — and nothing else. No `user-agent` at all.
 Several APIs require one (GitHub rejects UA-less requests outright), so its
 absence is a request that fails for a reason the caller cannot see in the
 status.
-
-Separately, `ycs` builds URLs by interpolating bucket keys with `{s}` and no
-escaping. A key containing a space, `?` or `#` silently changes the request
-target. A percent-encoding helper that writes into a caller buffer is a few
-lines and removes a whole class of latent bug.
 
 ## Tier 2 — for remote API work generally
 
@@ -119,6 +120,12 @@ lines and removes a whole class of latent bug.
   fresh-connection. `Connection` already does this; what is missing is a
   documented, bounded way to hold one open for an origin.
 * **Basic-auth helper** — base64 into a caller buffer, mostly for the CLI.
+* **Percent-encoding for URL building.** `ycs` interpolates bucket keys into
+  URLs with `{s}` and no escaping, which drafted as a Tier 1 latent bug — a key
+  containing a space, `?` or `#` would silently change the request target.
+  **Checked: those keys are URL-safe**, so nothing is broken today and this is
+  defence against a future key rather than a fix. Demoted on that evidence,
+  which is the only reason it moved.
 
 ### Retry is the caller's, and zurl only supplies the ingredients
 

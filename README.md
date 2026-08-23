@@ -129,8 +129,7 @@ Two conclusions worth stating plainly:
   - [ ] redirects, `max_redirects = 0` by default, with cross-origin
         `authorization` stripped structurally (the harness carries a live IAM
         bearer token)
-  - [ ] a default `user-agent`, and percent-encoding for URL building — `ycs`
-        interpolates bucket keys with `{s}` and no escaping
+  - [ ] a default `user-agent` — zurl sends none, and some APIs reject that
 - [ ] point the zoxy benchmark's control plane at zurl and delete its std
       wrapper. Blocked on Tier 1: `std.http.Client` follows redirects silently
       today, so swapping in a client that does not would turn a followed 302
