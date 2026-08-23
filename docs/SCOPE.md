@@ -139,6 +139,13 @@ opt-in with a caller-supplied window.
 
 ### Redirects: implemented, default OFF, auth stripped structurally
 
+**Landed.** `FetchRequest.redirects` is `{ max: u8 = 0, buf: []u8 }`. The
+buffer bounds the whole CHAIN rather than one URL, because a hop's URL must
+stay valid while the next is resolved against it; running out is
+`TooManyRedirects`, never a truncated location. A 3xx whose body would have
+been followed is left unread on the wire rather than delivered to the caller's
+sink.
+
 `std.http.Client.fetch` follows redirects by default, so the harness inherits
 that today and cannot see it — `Response` carries only a status. Swap in a
 client that does not follow, and an endpoint that 302s starts reporting a

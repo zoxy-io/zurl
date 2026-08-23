@@ -90,6 +90,31 @@ const res = try zurl.fetch(io, .{
 }) orelse return error.TimedOut;
 ```
 
+### Redirects
+
+**Off by default.** `std.http.Client` follows them silently, so a 302 there is
+invisible; here it comes back as a 302 you can see. Opt in with a hop count and
+a buffer, which bounds the whole chain:
+
+```zig
+var hops: [2 * 1024]u8 = undefined;
+const res = try zurl.fetch(io, .{
+    .url = url,
+    .authorization = "Bearer …",
+    .redirects = .{ .max = 3, .buf = &hops },
+}) orelse return error.TimedOut;
+```
+
+`authorization` follows the origin it was issued for and **nowhere else** — a
+hop to a different scheme, host or port drops it. That is structural, not a
+flag: otherwise a redirect is a way to collect your bearer token.
+
+303 rewrites the method to GET and drops the body; 301 and 302 do that for a
+POST only, because that is the whole of the historical deviation RFC 9110
+permits -- a PUT or DELETE keeps both. 307 and 308 always keep both, and HEAD
+survives every one of them. The body of a 3xx that gets followed is never
+delivered to your sink.
+
 ### https
 
 Trust anchors are **yours**. There is no default, on purpose: loading a store
@@ -142,7 +167,7 @@ Works identically on `Io.Threaded` and zio — both are production backends for
 its consumers, so a mechanism that only works on one is not a mechanism zurl
 uses.
 
-**Not yet:** redirects are not followed and no `user-agent` is sent.
+**Not yet:** no `user-agent` is sent.
 [docs/SCOPE.md](docs/SCOPE.md) is the list, in the order it will be built, and
 says what is deliberately refused (HTTP/2, cookies, connection pools, signing
 schemes).

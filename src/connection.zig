@@ -125,6 +125,31 @@ pub const Connection = struct {
         errdefer c.reusable = false;
 
         try writeRequest(c.out, req);
+        const head = try parser.parseHead(c.in, opts);
+        return c.finishBody(head, req.method, sink, opts, req.keep_alive);
+    }
+
+    /// Deliver the body of a head already read, and settle reuse.
+    ///
+    /// Split out of `roundTrip` so a caller that must SEE the head before
+    /// choosing where its body goes can do that without a second copy of this
+    /// logic. `fetch` needs exactly that for redirects: the body of a 3xx it
+    /// is about to follow must not reach the caller's sink, and the status
+    /// that decides it is only known once the head is parsed.
+    ///
+    /// `keep_alive_requested` is what the request asked for; the verdict is
+    /// still the exchange's.
+    pub fn finishBody(
+        c: *Connection,
+        head: parser.Head,
+        method: std.http.Method,
+        sink: Sink,
+        opts: parser.HeadOptions,
+        keep_alive_requested: bool,
+    ) Error!Response {
+        // Same reason as `roundTrip`: a body that fails part-way leaves the
+        // stream at an offset nobody knows.
+        errdefer c.reusable = false;
 
         var discard_buf: [512]u8 = undefined;
         var discarding: Io.Writer.Discarding = .init(&discard_buf);
@@ -135,15 +160,14 @@ pub const Connection = struct {
             .stream => |s| s,
         };
 
-        const head = try parser.parseHead(c.in, opts);
-        const body = try parser.streamBody(c.in, head, req.method, w, opts);
+        const body = try parser.streamBody(c.in, head, method, w, opts);
         if (sink == .lines) sink.lines.finish();
 
         // Reuse is the exchange's verdict, never the request's wish: asking for
         // keep-alive cannot make a close-delimited body reusable.
-        c.reusable = body.keep_alive and req.keep_alive;
+        c.reusable = body.keep_alive and keep_alive_requested;
         // streamBody's postcondition, checked where it is relied on.
-        if (head.bodyless(req.method)) assert(body.len == 0);
+        if (head.bodyless(method)) assert(body.len == 0);
 
         return .{ .status = head.status, .body_len = body.len };
     }

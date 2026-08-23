@@ -49,6 +49,14 @@ pub const FetchRequest = struct {
     /// the head does not re-run against the trailer. If a value is
     /// load-bearing, keep the FIRST occurrence, or stop recording once the
     /// body starts.
+    ///
+    /// **With `redirects.max` above zero this fires for EVERY hop**, including
+    /// ones whose status the caller never sees and whose body was dropped, and
+    /// nothing in the callback says which hop it belongs to. A caller
+    /// recording `location` or a rate-limit header across a chain therefore
+    /// sees the intermediate origins' answers mixed with the final one. Where
+    /// that matters, follow redirects yourself: `max = 0` makes each 3xx a
+    /// separate `fetch` you can attribute.
     on_header: ?parser.HeaderFn = null,
     /// Passed to `on_header` untouched. It is where a caller keeps whatever it
     /// copied out during the callback.
@@ -71,6 +79,8 @@ pub const FetchRequest = struct {
     /// file. Nothing here requests an encoding, so a compliant origin never
     /// triggers either path.
     allow_encoded_body: bool = false,
+    /// Whether, and how far, to follow a 3xx. Off unless asked.
+    redirects: Redirects = .{},
     deadline_ns: u64 = default_deadline_ns,
     /// Named in the timeout message. A key or a short label, never a URL — a
     /// URL can carry a token in its query, and logs are public.
@@ -84,8 +94,35 @@ pub const FetchRequest = struct {
     tls: ?tls_transport.Config = null,
 };
 
+/// Redirect policy. Following is OFF by default, and that is a decision.
+///
+/// `std.http.Client` follows redirects silently, so a caller migrating to zurl
+/// inherits whatever its endpoints were doing without ever having seen it —
+/// `Response` carries a status and nothing else. Defaulting to off turns a
+/// followed 302 into a visible non-ok status on the first run, which is a loud
+/// answer to a question nobody had asked. Turn it on where a run shows an
+/// endpoint actually redirects.
+pub const Redirects = struct {
+    /// How many hops to follow. Zero means the 3xx is the answer.
+    max: u8 = 0,
+    /// Where the chain is built: each hop's `location` is resolved against the
+    /// previous URL into this buffer, and the space is not reused between
+    /// hops, because a hop's URL must stay valid while the next is resolved
+    /// against it. So this bounds the whole chain, not one URL, and running
+    /// out is `error.TooManyRedirects` rather than a truncated location.
+    ///
+    /// Unused when `max` is zero. 2 KiB is comfortable for a handful of hops.
+    buf: []u8 = &.{},
+};
+
 pub const Error = error{
     InvalidUrl,
+    /// The chain hit `Redirects.max`, or `Redirects.buf` ran out before it
+    /// did. Distinct from a bad URL: every hop so far was well-formed.
+    TooManyRedirects,
+    /// A 3xx that cannot be followed — no `location`, or one that does not
+    /// resolve to an http/https URL.
+    InvalidRedirect,
     /// An https URL arrived with no `tls` config. Distinct from a TLS
     /// failure: nothing was dialed and nothing was wrong with the peer.
     TlsNotConfigured,
@@ -143,6 +180,146 @@ fn originFormTarget(uri: std.Uri, host: []const u8, buf: []u8) error{InvalidUrl}
     return target;
 }
 
+/// Whether a scheme is one `fetch` can dial.
+fn isHttpScheme(scheme: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https");
+}
+
+/// Default port for a scheme already known to be http or https.
+fn defaultPort(scheme: []const u8) u16 {
+    return if (std.ascii.eqlIgnoreCase(scheme, "https")) 443 else 80;
+}
+
+/// RFC 6454 same origin: scheme, host and effective port all equal.
+///
+/// This is what decides whether `authorization` survives a hop, so it is
+/// deliberately strict — a subdomain is a different origin, and http and https
+/// are different origins even on the same host. A hostless URI is never the
+/// same origin as anything, including itself: there is nothing to compare.
+fn sameOrigin(a: *const std.Uri, b: *const std.Uri) bool {
+    if (!std.ascii.eqlIgnoreCase(a.scheme, b.scheme)) return false;
+
+    // Switched exhaustively rather than reaching for `.percent_encoded`.
+    // `std.Uri.parse` only ever produces that variant today, but reading the
+    // wrong one is a panic, and this comparison is a SECURITY decision driven
+    // partly by a `location` header the peer chose. A future std that returns
+    // `.raw` here must break the build, not the credential rule.
+    const a_host = hostBytes(a) orelse return false;
+    const b_host = hostBytes(b) orelse return false;
+    if (!std.ascii.eqlIgnoreCase(a_host, b_host)) return false;
+
+    const a_port = a.port orelse defaultPort(a.scheme);
+    const b_port = b.port orelse defaultPort(b.scheme);
+    return a_port == b_port;
+}
+
+/// The host of `uri` as bytes, whichever component variant carries it.
+fn hostBytes(uri: *const std.Uri) ?[]const u8 {
+    const component = uri.host orelse return null;
+    return switch (component) {
+        .raw => |h| h,
+        .percent_encoded => |h| h,
+    };
+}
+
+/// Whether `status` is a redirect zurl knows how to follow.
+///
+/// 300 (Multiple Choices) is deliberately absent: it has no single `location`
+/// to follow and picking one would be zurl inventing a policy.
+fn redirectKind(status: u16) ?Redirect.Kind {
+    return switch (status) {
+        307, 308 => .same_method,
+        301, 302 => .historical_post_rewrite,
+        303 => .retrieve,
+        else => null,
+    };
+}
+
+/// What the next hop sends, given the status and the method that got the 3xx.
+pub const Redirect = struct {
+    method: std.http.Method,
+    /// False when the method changed: a GET produced by a rewrite has nothing
+    /// to send, and resending the old body under a new method would be a
+    /// different request than either endpoint expects.
+    keep_body: bool,
+
+    const Kind = enum { same_method, historical_post_rewrite, retrieve };
+
+    fn next(kind: Kind, from: std.http.Method) Redirect {
+        // HEAD survives everything. It is already a retrieval, and turning it
+        // into a GET changes WHAT is fetched rather than how it is framed — a
+        // caller probing for existence would silently start pulling bodies.
+        // `ycs.head` is a live caller of exactly that shape.
+        if (from == .HEAD) return .{ .method = .HEAD, .keep_body = false };
+
+        return switch (kind) {
+            // 307 and 308 exist precisely to say "same method, same body".
+            .same_method => .{ .method = from, .keep_body = true },
+            // 303 says "GET the other thing" outright, whatever was sent.
+            .retrieve => .{ .method = .GET, .keep_body = false },
+            // 301 and 302 are specified to preserve the method, and the
+            // universal historical deviation is narrower than it is usually
+            // described: RFC 9110 §15.4.2/§15.4.3 permit changing POST to GET
+            // and nothing else, and curl rewrites only POST too. A PUT or a
+            // DELETE keeps its method and its body — rewriting those would
+            // turn "delete this" into "fetch this" and report success.
+            .historical_post_rewrite => if (from == .POST)
+                .{ .method = .GET, .keep_body = false }
+            else
+                .{ .method = from, .keep_body = true },
+        };
+    }
+};
+
+/// Captures `location` for the redirect logic while passing every header on to
+/// the caller's own `on_header`.
+///
+/// It has to be one callback because the parser offers one, and it has to copy
+/// because `value` dies when the body streams.
+const HeadWatch = struct {
+    user: ?parser.HeaderFn,
+    user_ctx: ?*anyopaque,
+    /// Where `location` is copied. Also where it is resolved in place, so this
+    /// is the live front of `Redirects.buf`.
+    location_buf: []u8,
+    len: usize = 0,
+    found: bool = false,
+    /// Set when a `location` arrived that `dest` could not hold. Distinguished
+    /// from "no location" so the caller gets TooManyRedirects, not a silent
+    /// stop — rule 7: never a truncated URL.
+    overflowed: bool = false,
+
+    fn onHeader(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+        const self: *HeadWatch = @ptrCast(@alignCast(ctx.?));
+        if (self.user) |f| f(self.user_ctx, name, value);
+
+        if (!std.ascii.eqlIgnoreCase(name, "location")) return;
+        // FIRST location wins. A second one is either a broken origin or an
+        // attempt to have two clients disagree about where they went.
+        if (self.found or self.overflowed) return;
+        // Two different failures, kept apart: an absent location is a broken
+        // 3xx, an oversized one is the chain outgrowing its buffer.
+        if (value.len == 0) return;
+        if (value.len > self.location_buf.len) {
+            self.overflowed = true;
+            return;
+        }
+        @memcpy(self.location_buf[0..value.len], value);
+        self.len = value.len;
+        self.found = true;
+    }
+};
+
+/// Everything one attempt in a redirect chain needs that can change between
+/// hops. The first hop is the caller's request; later ones may have lost the
+/// `authorization` header and had their method rewritten.
+const Hop = struct {
+    uri: std.Uri,
+    method: std.http.Method,
+    body: ?[]const u8,
+    authorization: ?[]const u8,
+};
+
 const Task = struct {
     io: Io,
     req: *const FetchRequest,
@@ -156,8 +333,11 @@ const Task = struct {
         task.result = task.roundTrip();
     }
 
+    /// The whole fetch, including any redirect chain.
+    ///
+    /// Each hop is a fresh connection: `fetch` sends `connection: close`, so
+    /// there is nothing to reuse even when a redirect stays on one origin.
     fn roundTrip(task: *Task) Error!connection.Response {
-        const io = task.io;
         const req = task.req;
 
         // The URL is whatever string the caller was handed — from a config
@@ -165,7 +345,87 @@ const Task = struct {
         // an error, never an assertion: a consumer that forwards someone
         // else's URL must not be able to panic this library from off-box.
         if (req.url.len == 0) return error.InvalidUrl;
-        const uri = std.Uri.parse(req.url) catch return error.InvalidUrl;
+        var hop: Hop = .{
+            .uri = std.Uri.parse(req.url) catch return error.InvalidUrl,
+            .method = req.method,
+            .body = req.body,
+            .authorization = req.authorization,
+        };
+
+        // Programmer input: asking for hops without somewhere to build them is
+        // a misconfiguration, and the first redirect would otherwise report
+        // TooManyRedirects -- true, but it would read as "the chain was long".
+        assert(req.redirects.max == 0 or req.redirects.buf.len > 0);
+
+        var chain = req.redirects.buf;
+        var hops_left = req.redirects.max;
+
+        // lint:unbounded-ok — `hops_left` strictly decreases on the only path
+        // that continues, and every other path returns.
+        while (true) {
+            var watch: HeadWatch = .{
+                .user = req.on_header,
+                .user_ctx = req.ctx,
+                .location_buf = chain,
+            };
+            const outcome = try task.attempt(&hop, &watch, hops_left > 0);
+
+            const followable = hops_left > 0 and redirectKind(outcome.status) != null;
+            if (!followable) return outcome;
+
+            hop = try nextHop(&hop, &watch, outcome.status, &chain);
+            assert(hops_left > 0);
+            hops_left -= 1;
+        }
+    }
+
+    /// Resolve the next hop's URL against this one and apply the policy that
+    /// makes following safe.
+    fn nextHop(from: *const Hop, watch: *HeadWatch, status: u16, chain: *[]u8) Error!Hop {
+        // A location too long for the remaining buffer is the chain outgrowing
+        // its bound, never a truncated URL pointing somewhere else (rule 7).
+        if (watch.overflowed) return error.TooManyRedirects;
+        if (!watch.found) return error.InvalidRedirect;
+
+        // `location` is already at the front of `chain`, which is what
+        // resolveInPlace wants; it resolves relative references against the
+        // URL we came from and advances `chain` past what it used, so earlier
+        // hops stay valid while later ones are built.
+        // Established by `onHeader`: a found location is never empty, because
+        // the zero-length case returns before setting the flag.
+        assert(watch.len > 0);
+        assert(watch.len <= chain.len);
+
+        const to = std.Uri.resolveInPlace(from.uri, watch.len, chain) catch |err| return switch (err) {
+            error.NoSpaceLeft => error.TooManyRedirects,
+            else => error.InvalidRedirect,
+        };
+        if (!isHttpScheme(to.scheme)) return error.InvalidRedirect;
+
+        const next = Redirect.next(redirectKind(status).?, from.method);
+        return .{
+            .uri = to,
+            .method = next.method,
+            .body = if (next.keep_body) from.body else null,
+            // THE security rule, and structural rather than a flag: an
+            // `authorization` header follows the origin it was issued for and
+            // nowhere else. A redirect naming another host is otherwise a
+            // credential-exfiltration primitive — point one at your own server
+            // and collect whatever bearer token the caller was using.
+            .authorization = if (sameOrigin(&from.uri, &to)) from.authorization else null,
+        };
+    }
+
+    /// One request/response against one origin.
+    ///
+    /// `may_follow` decides where the body goes before the status is known,
+    /// which is why the head and the body are read in two steps: the body of a
+    /// 3xx that is about to be followed must not reach the caller's sink.
+    fn attempt(task: *Task, hop: *const Hop, watch: *HeadWatch, may_follow: bool) Error!connection.Response {
+        const io = task.io;
+        const req = task.req;
+        const uri = hop.uri;
+
         const secure = scheme: {
             if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) break :scheme true;
             if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) break :scheme false;
@@ -211,13 +471,47 @@ const Task = struct {
         // its frame is ~66 KiB; a plain-HTTP fetch has no business reserving
         // that. Zig sizes a frame for all of its own locals, not for the
         // branch taken, so the split is what keeps the http path at 20 KiB.
-        if (secure) return task.exchangeTls(&stream, host, target);
-        return task.exchangePlain(&stream, host, target);
+        if (secure) return task.exchangeTls(&stream, host, target, hop, watch, may_follow);
+        return task.exchangePlain(&stream, host, target, hop, watch, may_follow);
+    }
+
+    /// The exchange itself, once a transport exists. Shared by both so plain
+    /// and TLS cannot drift apart in redirect behaviour.
+    ///
+    /// The head and the body are read in two steps because the decision of
+    /// where the body goes depends on the status. A 3xx that will be followed
+    /// has its body left unread on the wire and the connection dropped —
+    /// legitimate because `fetch` sends `connection: close` and is about to
+    /// close anyway, and necessary because that body is not the caller's
+    /// answer and must never reach the caller's sink.
+    fn exchange(
+        task: *Task,
+        conn: *connection.Connection,
+        host: []const u8,
+        target: []const u8,
+        hop: *const Hop,
+        watch: *HeadWatch,
+        may_follow: bool,
+    ) Error!connection.Response {
+        const opts = task.headOptions(watch);
+        const head = try conn.roundTripHead(task.request(hop, host, target), opts);
+
+        if (may_follow and redirectKind(head.status) != null) {
+            // Nothing was delivered, and `body_len` says so rather than
+            // reporting a length nobody received.
+            return .{ .status = head.status, .body_len = 0 };
+        }
+        // `fetch` never reuses a connection, so the request never asked to.
+        return conn.finishBody(head, hop.method, task.req.sink, opts, false);
     }
 
     /// What the parser is told about the head, built once so the two
     /// transports cannot drift apart in what they observe.
-    fn headOptions(task: *Task) parser.HeadOptions {
+    ///
+    /// `on_header` is always `HeadWatch`'s, never the caller's directly: the
+    /// parser offers one callback and redirects need `location` from it, so
+    /// the watch chains to the caller's.
+    fn headOptions(task: *Task, watch: *HeadWatch) parser.HeadOptions {
         // Programmer input, not wire input, so an assertion is right where a
         // URL gets an error: every parser entry point asserts this, and
         // catching it at the boundary that BUILDS the options names the
@@ -225,8 +519,8 @@ const Task = struct {
         assert(task.req.max_head_bytes > 0);
 
         return .{
-            .on_header = task.req.on_header,
-            .ctx = task.req.ctx,
+            .on_header = HeadWatch.onHeader,
+            .ctx = watch,
             .max_head_bytes = task.req.max_head_bytes,
             .allow_encoded_body = task.req.allow_encoded_body,
         };
@@ -234,18 +528,20 @@ const Task = struct {
 
     /// The request every exchange sends, built once so the two transports
     /// cannot drift apart in what they ask for.
-    fn request(task: *Task, host: []const u8, target: []const u8) connection.Request {
+    fn request(task: *Task, hop: *const Hop, host: []const u8, target: []const u8) connection.Request {
         assert(host.len > 0);
         assert(target.len > 0);
 
         return .{
-            .method = task.req.method,
+            // From the HOP, not the request: a redirect may have rewritten the
+            // method and may have dropped the credential.
+            .method = hop.method,
             .target = target,
             .host = host,
-            .authorization = task.req.authorization,
+            .authorization = hop.authorization,
             .content_type = task.req.content_type,
             .extra = task.req.extra,
-            .body = task.req.body,
+            .body = hop.body,
             // One request per fetch: close is what gives a reply with no
             // discoverable body end somewhere to stop (a60a95c), and there is
             // no pool that reuse would feed.
@@ -258,6 +554,9 @@ const Task = struct {
         stream: *net.Stream,
         host: []const u8,
         target: []const u8,
+        hop: *const Hop,
+        watch: *HeadWatch,
+        may_follow: bool,
     ) Error!connection.Response {
         assert(host.len > 0);
         assert(target.len > 0);
@@ -270,7 +569,7 @@ const Task = struct {
         var w = stream.writer(io, &write_buffer);
 
         var conn = connection.Connection.init(&r.interface, &w.interface);
-        return conn.roundTrip(task.request(host, target), task.req.sink, task.headOptions());
+        return task.exchange(&conn, host, target, hop, watch, may_follow);
     }
 
     /// The same exchange with a TLS session spliced into the transport, which
@@ -281,6 +580,9 @@ const Task = struct {
         stream: *net.Stream,
         host: []const u8,
         target: []const u8,
+        hop: *const Hop,
+        watch: *HeadWatch,
+        may_follow: bool,
     ) Error!connection.Response {
         const io = task.io;
         // Checked before the dial; re-read here rather than threaded through.
@@ -320,7 +622,7 @@ const Task = struct {
         defer transport.close();
 
         var conn = connection.Connection.init(transport.reader(), transport.writer());
-        return conn.roundTrip(task.request(host, target), task.req.sink, task.headOptions());
+        return task.exchange(&conn, host, target, hop, watch, may_follow);
     }
 };
 
@@ -701,4 +1003,336 @@ test "max_head_bytes is the caller's, and refuses a head that outgrows it" {
         .url = url,
         .max_head_bytes = 64,
     }));
+}
+
+/// Serve `count` sequential connections, one canned response each.
+fn serveSeq(srv: *net.Server, sio: Io, responses: []const []const u8, seen: *[4][256]u8, seen_len: *usize) void {
+    for (responses) |response| {
+        var s = srv.accept(sio) catch return;
+        defer s.close(sio);
+
+        var rb: [2048]u8 = undefined;
+        var rr = s.reader(sio, &rb);
+        var w: Io.Writer = .fixed(&seen[seen_len.*]);
+        // lint:unbounded-ok — the client sends a finite head; a peer that
+        // never sends the blank line fails the read and returns.
+        while (true) {
+            const line = rr.interface.takeDelimiterInclusive('\n') catch return;
+            if (line.len <= 2) break;
+            w.writeAll(line) catch {};
+        }
+        seen_len.* += 1;
+
+        var wb: [512]u8 = undefined;
+        var ww = s.writer(sio, &wb);
+        ww.interface.writeAll(response) catch return;
+        ww.interface.flush() catch return;
+    }
+}
+
+test "a 3xx is the answer unless following was asked for" {
+    // The default, and the whole reason it is the default: std.http.Client
+    // follows silently, so a caller swapping to zurl would otherwise inherit
+    // a behaviour it had never seen. Off means the 302 is visible.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const responses = [_][]const u8{
+        "HTTP/1.1 302 Found\r\nlocation: /moved\r\ncontent-length: 4\r\n\r\nnope",
+    };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/start", .{port});
+
+    var body: Io.Writer.Allocating = .init(t.allocator);
+    defer body.deinit();
+    const res = (try fetch(io, .{ .url = url, .sink = .{ .collect = &body } })).?;
+
+    try t.expectEqual(@as(u16, 302), res.status);
+    // Not following means the 3xx body IS the answer and is delivered.
+    try t.expectEqualStrings("nope", body.written());
+    try t.expectEqual(@as(usize, 1), seen_len);
+}
+
+test "a followed redirect rewrites the method, drops the body, and delivers only the last body" {
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const responses = [_][]const u8{
+        // 303 says GET the other thing, so the POST body must not be resent.
+        "HTTP/1.1 303 See Other\r\nlocation: /final\r\ncontent-length: 7\r\n\r\nignored",
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nfinal",
+    };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/start", .{port});
+
+    var hop_buf: [2048]u8 = undefined;
+    var body: Io.Writer.Allocating = .init(t.allocator);
+    defer body.deinit();
+    const res = (try fetch(io, .{
+        .url = url,
+        .method = .POST,
+        .body = "payload",
+        .content_type = "text/plain",
+        .sink = .{ .collect = &body },
+        .redirects = .{ .max = 3, .buf = &hop_buf },
+    })).?;
+
+    try t.expectEqual(@as(u16, 200), res.status);
+    // Only the FINAL body reaches the sink. The 303's body was never read.
+    try t.expectEqualStrings("final", body.written());
+    try t.expectEqual(@as(usize, 2), seen_len);
+
+    const first = seen[0][0..];
+    const second = seen[1][0..];
+    try t.expect(std.mem.startsWith(u8, first, "POST /start "));
+    // 303 rewrote it, and a GET carries no content-length.
+    try t.expect(std.mem.startsWith(u8, second, "GET /final "));
+    try t.expect(std.mem.indexOf(u8, second, "content-length") == null);
+}
+
+test "authorization follows the origin it was issued for, and nowhere else" {
+    // THE security property of following redirects. `ycs` carries a live IAM
+    // bearer token, so an origin that answers 302 with a location pointing
+    // somewhere else must not be handed that token — otherwise a redirect is
+    // a credential-exfiltration primitive: point one at your own server and
+    // collect whatever the caller was using.
+    //
+    // Two listeners on 127.0.0.1 with different ports are two different
+    // origins by RFC 6454, which is exactly the rule being tested.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var origin_a = try addr.listen(io, .{ .reuse_address = true });
+    defer origin_a.deinit(io);
+    var origin_b = try addr.listen(io, .{ .reuse_address = true });
+    defer origin_b.deinit(io);
+    const port_a = origin_a.socket.address.getPort();
+    const port_b = origin_b.socket.address.getPort();
+
+    // A sends a same-origin hop first (relative location, so the credential
+    // must survive), then a cross-origin hop to B (where it must not).
+    var to_b_buf: [128]u8 = undefined;
+    const to_b = try std.fmt.bufPrint(
+        &to_b_buf,
+        "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{d}/b\r\ncontent-length: 0\r\n\r\n",
+        .{port_b},
+    );
+    const a_responses = [_][]const u8{
+        "HTTP/1.1 302 Found\r\nlocation: /same\r\ncontent-length: 0\r\n\r\n",
+        to_b,
+    };
+    const b_responses = [_][]const u8{"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"};
+
+    var seen_a: [4][256]u8 = undefined;
+    var seen_a_len: usize = 0;
+    var seen_b: [4][256]u8 = undefined;
+    var seen_b_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &origin_a, io, a_responses[0..], &seen_a, &seen_a_len });
+    try group.concurrent(io, serveSeq, .{ &origin_b, io, b_responses[0..], &seen_b, &seen_b_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/start", .{port_a});
+
+    var hop_buf: [2048]u8 = undefined;
+    const res = (try fetch(io, .{
+        .url = url,
+        .authorization = "Bearer secret-iam-token",
+        .redirects = .{ .max = 3, .buf = &hop_buf },
+    })).?;
+
+    try t.expectEqual(@as(u16, 200), res.status);
+    try t.expectEqual(@as(usize, 2), seen_a_len);
+    try t.expectEqual(@as(usize, 1), seen_b_len);
+
+    // Same origin: the credential is still there on the second request to A.
+    try t.expect(std.mem.indexOf(u8, seen_a[0][0..], "secret-iam-token") != null);
+    try t.expect(std.mem.indexOf(u8, seen_a[1][0..], "secret-iam-token") != null);
+    // Cross origin: B never sees it.
+    try t.expect(std.mem.indexOf(u8, seen_b[0][0..], "secret-iam-token") == null);
+    try t.expect(std.mem.indexOf(u8, seen_b[0][0..], "authorization") == null);
+}
+
+test "a chain that will not terminate is bounded, and says which bound it hit" {
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    // Always redirects, never arrives.
+    const loop = "HTTP/1.1 302 Found\r\nlocation: /again\r\ncontent-length: 0\r\n\r\n";
+    const responses = [_][]const u8{ loop, loop, loop, loop };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/start", .{port});
+
+    // max = 2 means three requests total, and the third 302 is the answer
+    // rather than an error: the caller asked for two hops and got two.
+    var hop_buf: [2048]u8 = undefined;
+    const res = (try fetch(io, .{
+        .url = url,
+        .redirects = .{ .max = 2, .buf = &hop_buf },
+    })).?;
+    try t.expectEqual(@as(u16, 302), res.status);
+    try t.expectEqual(@as(usize, 3), seen_len);
+}
+
+test "a 3xx with no usable location is an error, not a silent stop" {
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    // A 302 promising a location and not giving one. Following was asked for,
+    // so silently returning the 3xx would look like "the server answered 302"
+    // when what happened is "zurl could not do what you asked".
+    const responses = [_][]const u8{"HTTP/1.1 302 Found\r\ncontent-length: 0\r\n\r\n"};
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/start", .{port});
+
+    var hop_buf: [2048]u8 = undefined;
+    try t.expectError(error.InvalidRedirect, fetch(io, .{
+        .url = url,
+        .redirects = .{ .max = 3, .buf = &hop_buf },
+    }));
+}
+
+test "a redirected HEAD stays a HEAD" {
+    // 303 means "GET the other thing", but a HEAD is already a retrieval and
+    // rewriting it changes WHAT is fetched, not how it is framed: a caller
+    // probing for existence would silently start pulling bodies. curl
+    // preserves it and so does this. `ycs.head` is a live caller.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const responses = [_][]const u8{
+        "HTTP/1.1 303 See Other\r\nlocation: /final\r\ncontent-length: 0\r\n\r\n",
+        // A HEAD reply advertises the length its GET would have had, and
+        // carries no body — which is also why the fetch must not hang here.
+        "HTTP/1.1 200 OK\r\ncontent-length: 512\r\n\r\n",
+    };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/start", .{port});
+
+    var hop_buf: [2048]u8 = undefined;
+    const res = (try fetch(io, .{
+        .url = url,
+        .method = .HEAD,
+        .redirects = .{ .max = 2, .buf = &hop_buf },
+    })).?;
+
+    try t.expectEqual(@as(u16, 200), res.status);
+    try t.expectEqual(@as(u64, 0), res.body_len);
+    try t.expectEqual(@as(usize, 2), seen_len);
+    try t.expect(std.mem.startsWith(u8, seen[0][0..], "HEAD /start "));
+    try t.expect(std.mem.startsWith(u8, seen[1][0..], "HEAD /final "));
+}
+
+test "302 rewrites only POST; DELETE keeps its method and body" {
+    // The historical POST->GET deviation is narrower than it is usually
+    // described. RFC 9110 §15.4.2/§15.4.3 permit changing POST to GET and
+    // nothing else, and curl rewrites only POST. Rewriting a DELETE would
+    // turn "delete this" into "fetch this" and then report success, which is
+    // the worst shape a redirect bug can take.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const responses = [_][]const u8{
+        "HTTP/1.1 302 Found\r\nlocation: /moved\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\ngone",
+    };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/thing", .{port});
+
+    var hop_buf: [2048]u8 = undefined;
+    const res = (try fetch(io, .{
+        .url = url,
+        .method = .DELETE,
+        .body = "why",
+        .redirects = .{ .max = 2, .buf = &hop_buf },
+    })).?;
+
+    try t.expectEqual(@as(u16, 200), res.status);
+    try t.expectEqual(@as(usize, 2), seen_len);
+    try t.expect(std.mem.startsWith(u8, seen[0][0..], "DELETE /thing "));
+    // Method preserved, and so is the body it was carrying.
+    try t.expect(std.mem.startsWith(u8, seen[1][0..], "DELETE /moved "));
+    try t.expect(std.mem.indexOf(u8, seen[1][0..], "content-length: 3") != null);
 }
