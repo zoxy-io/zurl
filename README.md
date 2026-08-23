@@ -10,7 +10,8 @@ text for months.
 Every one of those is a design rule here. **Start with
 [docs/DESIGN.md](docs/DESIGN.md)** (the eight rules, each traceable to an
 incident) and [docs/RESEARCH.md](docs/RESEARCH.md) (what exists in the
-ecosystem and why none of it fits).
+ecosystem and why none of it fits). How it is written and how a change
+lands: [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) and [CLAUDE.md](CLAUDE.md).
 
 Private while it is an experiment. Zig 0.16.0, zero dependencies.
 
