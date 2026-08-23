@@ -4,10 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // hparse is a real dependency now, not the -Dhparse experiment: it is the
+    // head scanner src/parser.zig runs on. DESIGN.md rule 6 records why the
+    // leaf-package guarantee survives it — hparse is std-only and brings no
+    // runtime and no TLS stack of its own, so it cannot be the second copy of
+    // anything a consumer already pins.
+    const hparse_dep = b.dependency("hparse", .{ .target = target, .optimize = optimize });
+    const hparse_mod = hparse_dep.module("hparse");
+    const hparse_import: std.Build.Module.Import = .{ .name = "hparse", .module = hparse_mod };
+
     const mod = b.addModule("zurl", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{hparse_import},
     });
 
     // Compile-only gate for the executables that are otherwise reachable only
@@ -21,6 +31,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{hparse_import},
         }),
     });
     check_step.dependOn(&tests.step);
@@ -44,22 +55,21 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{hparse_import},
         }),
         .filters = &.{"fuzz"},
     });
     const fuzz_step = b.step("fuzz", "Run the parser fuzz oracles: corpus, mutations, vacuity");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
-    // The hparse comparison: a temporary experiment, off by default, whose
-    // whole purpose is to answer "would that dependency pay for itself?" with
-    // a measurement. Nothing under src/ imports hparse — the prototype head
-    // parser lives in bench/head.zig — so the library stays a leaf package
-    // whichever way the answer goes.
-    const hparse_step = b.step("bench-head", "Compare head parsers with hparse (needs -Dhparse)");
-    const hparse_enabled = b.option(bool, "hparse", "Enable the temporary hparse comparison") orelse false;
-    if (!hparse_enabled) {
-        hparse_step.dependOn(&b.addFail("bench-head needs -Dhparse (see docs/RESEARCH.md)").step);
-    } else if (b.lazyDependency("hparse", .{ .target = target, .optimize = optimize })) |hparse_dep| {
+    // The head-parser comparison. It was `-Dhparse`-gated while hparse was an
+    // experiment the default build must not fetch; hparse is a real dependency
+    // now, so the gate is gone and the harness is an ordinary benchmark. It
+    // stays because the question it answers did not stop being asked when the
+    // answer changed: it is what measures the segmented cases (rule 8), which
+    // is where adopting the resume cursor was supposed to pay.
+    const hparse_step = b.step("bench-head", "Compare head parsers, whole and segmented");
+    {
         const exe = b.addExecutable(.{
             .name = "bench-head",
             .root_module = b.createModule(.{
@@ -68,10 +78,12 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "zurl", .module = mod },
-                    .{ .name = "hparse", .module = hparse_dep.module("hparse") },
+                    hparse_import,
                 },
             }),
         });
+        check_step.dependOn(&exe.step);
+
         const run = b.addRunArtifact(exe);
         if (b.args) |args| run.addArgs(args);
         hparse_step.dependOn(&run.step);

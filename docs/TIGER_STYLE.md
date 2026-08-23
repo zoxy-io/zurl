@@ -63,11 +63,13 @@ say *what must be true*. Neither overrides the other.
 ## Non-negotiables
 
 - **Zero allocation** — see the delta above. Any allocation is the caller's.
-- **Zero dependencies beyond the Zig toolchain** (rule 6). zurl is a *leaf*
-  package on purpose: a second copy of a runtime or TLS pin in a consumer's
-  graph turns every version bump into an n-way agreement. zio enters through
-  `std.Io`; TLS enters through the transport parameter. Adding a `.dependencies`
-  entry requires a written argument that the seam cannot carry it.
+- **Leaf package** (rule 6). zurl is a *leaf* on purpose: a second copy of a
+  runtime or TLS pin in a consumer's graph turns every version bump into an
+  n-way agreement. zio enters through `std.Io`; TLS enters through the
+  transport parameter. `hparse` is the one pin, and rule 6 lists what it had
+  to clear to get there — std-only, version-locked with zurl, not carriable by
+  the seam, and justified by measurement. Adding another needs the same
+  argument, not a precedent.
 - **Put a limit on everything.** Every loop and every buffer has a fixed upper
   bound the reader can see. `max_head_bytes` exists because a server can send
   valid-sized header lines forever; anything with the same shape gets the same

@@ -75,12 +75,34 @@ std TLS, zrk's ztls, an in-memory pipe in a test — all the same type. `fetch`
 is the convenience layer that dials for you; `Connection` is the layer that
 does not care.
 
-## 6. Zero dependencies
+## 6. A leaf package: no runtime, no TLS stack, no third copy of anything
 
 benchmark's `build.zig.zon` documents how two copies of zio fail to unify
 ("file exists in modules 'zio_options' and 'zio_options0'"), and every extra
-pin makes a version bump an n-way agreement. zurl imports `std` and nothing
-else. zio enters through `std.Io`; TLS enters through rule 5.
+pin makes a version bump an n-way agreement. That is the harm. zio enters
+through `std.Io`; TLS enters through rule 5.
+
+This rule read **"zero dependencies"** until zurl adopted `zoxy-io/hparse` as
+its head scanner, and the rename is the honest version of what it always
+protected. Zero was a proxy for leaf-ness, and a cheap one to check; it was
+never the property that mattered. A pin earns its place only by clearing all
+of:
+
+- **std-only itself**, so it cannot drag a runtime or a TLS stack in behind it.
+  hparse takes a byte slice and writes spans. It has no I/O, so there is
+  nothing for a consumer's zio or ztls to collide with.
+- **Version-locked with zurl, not with the consumer.** hparse and zurl are the
+  same project under one owner and are bumped together, so a consumer never
+  arbitrates between them. A pin a consumer might *also* pin independently is
+  the n-way agreement this rule exists to prevent, and is still refused.
+- **Not expressible through the transport seam.** Rule 5 carries anything that
+  is I/O. A head scanner is not: it is pure computation on bytes the seam has
+  already delivered.
+- **Paid for in measurement, not taste** (rule 8). docs/RESEARCH.md carries the
+  numbers both ways, including the one that first argued *against* adopting it.
+
+Two dependencies is not automatically twice the harm, and one is not
+automatically none. The count is not the test; the four bullets are.
 
 ## 7. Overlong input is dropped whole and counted, never truncated
 

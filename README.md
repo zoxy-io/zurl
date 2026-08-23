@@ -13,7 +13,9 @@ incident) and [docs/RESEARCH.md](docs/RESEARCH.md) (what exists in the
 ecosystem and why none of it fits). How it is written and how a change
 lands: [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) and [CLAUDE.md](CLAUDE.md).
 
-Private while it is an experiment. Zig 0.16.0, zero dependencies.
+Private while it is an experiment. Zig 0.16.0; one dependency,
+[zoxy-io/hparse](https://github.com/zoxy-io/hparse), which supplies the head
+scanner (rule 6 says what a pin has to clear).
 
 ## Shape
 
@@ -55,14 +57,25 @@ never a number carried over from another day.
 
 | shape | ns/resp | throughput |
 |---|---|---|
-| small-cl (8 headers, 128 B body) | 116 | 8.6 M resp/s |
-| zrk-1k (proxy-bench shape, 1 KiB body) | **61** | 16.5 M resp/s, 18.4 GB/s |
-| cadvisor (1.5 MiB chunked → LineSink) | 0.18 ms/scrape | 8.2 GB/s, 14.7 k lines |
+| small-cl (8 headers, 128 B body) | 121 | 8.3 M resp/s |
+| zrk-1k (proxy-bench shape, 1 KiB body) | **48** | 20.8 M resp/s, 22.9 GB/s |
+| cadvisor (1.5 MiB chunked → LineSink) | 0.19 ms/scrape | 8.0 GB/s, 14.7 k lines |
+
+The head scan is `zoxy-io/hparse` as of the adoption commit. A/B on one box in
+one session, three interleaved pairs against the hand-rolled scanner it
+replaced: **zrk-1k 62 → 48 ns**, bands 18.1–18.2 → 22.8–22.9 GB/s and nowhere
+near touching; small-cl a wash at 121–122 ns; cadvisor unmoved. That split is
+what docs/RESEARCH.md's fitted model predicted — hparse wins on fixed cost and
+loses slightly on per-header slope, so the crossover sits around ten headers
+and small-cl has eight. The much larger win is not in this table at all: it is
+the segmented case, where the old scanner was linear and the *one-shot* hparse
+API was quadratic, and `parseResponseResume` is what made adoption possible.
 
 Assertions (docs/TIGER_STYLE.md) are `std.debug.assert`, so they are absent
 from the table above *by construction* — ReleaseFast compiles them out.
 Measured where they do run — ReleaseSafe, four A/B pairs interleaved against
-the same code without them: small-cl 129–132 → 133–137 ns, zrk-1k 68–70 →
+the same code without them, **before the hparse adoption and not re-run
+since**: small-cl 129–132 → 133–137 ns, zrk-1k 68–70 →
 70–74 ns, cadvisor unmoved at 0.19–0.20 ms. Three to five percent on the
 head-heavy shapes and nothing on the body-heavy one, which spends its time in
 `streamExact64` and `LineSink.feed` rather than in the head.
@@ -77,10 +90,11 @@ body, three runs:
 
 Two conclusions worth stating plainly:
 
-* **The parser is not the story at the wire.** 61 ns of parse inside a ~10 µs
-  loopback round trip is 0.6%. Any pitch to zrk rests on API and correctness,
-  not speed — and per the standing rule, zrk adopts nothing without running
-  these numbers itself in its own harness.
+* **The parser is not the story at the wire.** 48 ns of parse inside a ~10 µs
+  loopback round trip is 0.5%, and it was 0.6% before hparse — a 23% faster
+  head scan moved the round trip by a tenth of a percent. Any pitch to zrk
+  rests on API and correctness, not speed — and per the standing rule, zrk
+  adopts nothing without running these numbers itself in its own harness.
 * **The benchmark caught a real API defect on its first run.** The first
   `fetch` waited on its deadline by polling a flag every 20 ms — a 166×
   latency floor (50 req/s) that all 16 correctness tests passed over without

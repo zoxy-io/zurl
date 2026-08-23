@@ -22,12 +22,19 @@ jobs:
     name: gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Zig 0.16.0 exactly. std.Io moves, so master and 0.15 are both wrong;
-      # build.zig.zon's minimum_zig_version is the single source of that pin
-      # and setup-zig reads it when `version` is left empty.
-      - uses: mlugg/setup-zig@v2
+      # Zig 0.16.0 exactly. std.Io moves, so master and 0.15 are both wrong.
+      # `version` is left empty so setup-zig reads minimum_zig_version from
+      # build.zig.zon — one source for the pin, so a toolchain bump cannot
+      # land in the manifest and miss the workflow.
+      #
+      # The ACTION is pinned to a commit, not to the floating `@v2`. That
+      # field is named a MINIMUM, and today setup-zig installs it literally;
+      # a future v2.x reading it as a floor instead would silently build with
+      # a different toolchain and no diff in this repo, which is exactly what
+      # "0.16.0 exactly" forbids. Bump both together, deliberately.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
 
       - name: zig fmt --check
         run: zig fmt --check src bench smoke build.zig build.zig.zon
@@ -51,7 +58,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       - name: zig build tls-smoke
         run: zig build tls-smoke

@@ -3,31 +3,26 @@
     .version = "0.0.0",
     .fingerprint = 0x2ef103580a0b50f9, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    // ZERO dependencies, deliberately. zurl is std-only so that it is a LEAF
-    // package: the zoxy-benchmark repo already documents how two copies of zio
-    // fail to unify across a module boundary ("file exists in modules
-    // 'zio_options' and 'zio_options0'"), and a client that dragged its own
-    // async runtime or TLS pin into that graph would make every bump a
-    // three-way agreement. Anything backend-specific (zio, a TLS stack) enters
-    // through std.Io and the transport parameter, never through this file.
-    // TEMPORARY, lazy, and reachable only through `-Dhparse`. zurl ships zero
-    // dependencies (DESIGN.md rule 6) and this pin does not change that: it is
-    // marked lazy, so nothing fetches it unless the experiment is asked for,
-    // and nothing under src/ imports it — the comparison lives in bench/.
+    // ONE dependency, deliberately, and the argument for it is in
+    // docs/RESEARCH.md rather than in this comment: hparse's head scanner is
+    // faster than the one it replaces, and zoxy-io/zurl and zoxy-io/hparse are
+    // bumped together, so the n-way-agreement cost rule 6 was written about is
+    // not the cost this pin actually carries.
     //
-    // It exists to settle one question with a number instead of an argument
-    // (rule 8): would zoxy-io/hparse's SIMD head parser be worth the
-    // dependency? docs/RESEARCH.md carries the verdict. When that verdict is
-    // acted on, this entry either moves into the real dependency set or is
-    // deleted; it is not meant to sit here.
+    // What rule 6 protected is still protected. hparse is std-only and
+    // backend-agnostic: it takes a byte slice and writes spans, so it drags in
+    // no async runtime and no TLS stack, and a consumer that already pins zio
+    // or a TLS library still cannot end up with two copies of one through
+    // zurl. That was always the real claim; "zero" was the cheap way to
+    // guarantee it.
     //
-    // The ref is the one zoxy audits and pins — its DESIGN.md §7 hardening
-    // gate (PR #3: CRLF-only line terminators + extension-method tokens).
+    // NOT lazy. It was lazy while it was an experiment reachable only through
+    // -Dhparse; src/parser.zig imports it now, so a lazy pin would just be a
+    // fetch failure deferred to first use.
     .dependencies = .{
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#65521edfc09f19c5574a3360e2ce236c6dbc3be3",
-            .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
-            .lazy = true,
+            .url = "git+https://github.com/zoxy-io/hparse#87fd39de91192c46807dc22b70f6a340c3b80362",
+            .hash = "hparse-0.2.0-IukW0t5AAgD8yb3LKVDZW2nWDOHP2Z-I6ijF8m6jCFwE",
         },
     },
     .paths = .{
