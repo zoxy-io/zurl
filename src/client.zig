@@ -62,6 +62,15 @@ pub const FetchRequest = struct {
     /// The head must also fit whole in the transport's read buffer, so the
     /// smaller of the two wins.
     max_head_bytes: usize = parser.HeadOptions.max_head_bytes_default,
+    /// Accept a body still in its `content-encoding` rather than refusing it.
+    ///
+    /// zurl decodes no content codings, so a `gzip` response is refused with
+    /// `UnsupportedContentEncoding` by default — handing compressed bytes to a
+    /// sink expecting text is the incident this library exists for. Set this
+    /// when the sink genuinely wants the raw bytes, such as writing them to a
+    /// file. Nothing here requests an encoding, so a compliant origin never
+    /// triggers either path.
+    allow_encoded_body: bool = false,
     deadline_ns: u64 = default_deadline_ns,
     /// Named in the timeout message. A key or a short label, never a URL — a
     /// URL can carry a token in its query, and logs are public.
@@ -219,6 +228,7 @@ const Task = struct {
             .on_header = task.req.on_header,
             .ctx = task.req.ctx,
             .max_head_bytes = task.req.max_head_bytes,
+            .allow_encoded_body = task.req.allow_encoded_body,
         };
     }
 

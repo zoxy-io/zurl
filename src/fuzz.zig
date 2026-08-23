@@ -95,6 +95,12 @@ const corpus: []const []const u8 = &.{
     // duplicate lengths are the smuggling primitive.
     "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n",
     "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ncontent-length: 5\r\n\r\n",
+    // content-encoding decides whether a body may be delivered at all, so it
+    // is a framing shape: refused when a body follows, ignored when the
+    // status is bodyless, and `identity` never refused.
+    "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 4\r\n\r\nabcd",
+    "HTTP/1.1 200 OK\r\ncontent-encoding: identity\r\ncontent-length: 2\r\n\r\nhi",
+    "HTTP/1.1 204 No Content\r\ncontent-encoding: gzip\r\n\r\n",
     // Keep-alive bookkeeping, both directions.
     "HTTP/1.1 301 Moved\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
     "HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 2\r\n\r\nhi",

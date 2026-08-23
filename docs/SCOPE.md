@@ -119,7 +119,14 @@ not a wart.
 
 ### Content-Encoding: decode or refuse, never pass through
 
-This is a correctness hole, not a feature. `writeRequest` sends no
+**Landed, as refuse.** A `content-encoding` other than `identity` is
+`UnsupportedContentEncoding` when a body would actually be delivered. Not when
+it would not: a HEAD echoes the headers its GET would have sent, so refusing on
+the header alone would break every HEAD against a gzip-serving origin.
+`allow_encoded_body` is the conspicuous opt-out for a caller that genuinely
+wants the raw bytes. Decoding remains unimplemented and optional.
+
+This was a correctness hole, not a feature. `writeRequest` sends no
 `accept-encoding`, so a compliant origin returns identity — but a server that
 gzips anyway hands compressed bytes straight to `LineSink`, which parses them
 as text.

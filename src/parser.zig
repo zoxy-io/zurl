@@ -40,6 +40,12 @@ pub const Error = error{
     HeadTooLong,
     UnexpectedEof,
     ReadFailed,
+    /// The body carries a `content-encoding` zurl does not decode, and the
+    /// caller did not ask for it undecoded. Refused rather than passed
+    /// through: rule 2 says the caller never sees an undecoded byte, and
+    /// handing compressed bytes to a sink expecting text is exactly the
+    /// incident this library exists for.
+    UnsupportedContentEncoding,
     /// The SINK failed, not the transport. Distinct on purpose: a full collect
     /// buffer and a dead connection demand different reactions.
     WriteFailed,
@@ -54,6 +60,12 @@ pub const Head = struct {
     keep_alive: bool,
     content_length: ?u64 = null,
     chunked: bool = false,
+    /// The origin named a `content-encoding` other than `identity`, so the
+    /// body on the wire is NOT the body the caller asked for.
+    ///
+    /// A bool rather than the name, because the name is a slice of the
+    /// reader's buffer and would dangle the moment the body streams.
+    encoded_body: bool = false,
 
     /// RFC 9112 §6.3: HEAD responses and 1xx/204/304 statuses never carry a
     /// body, whatever Content-Length or Transfer-Encoding claim. Consuming a
@@ -78,6 +90,14 @@ pub const HeadOptions = struct {
     /// as sent; values are trimmed of leading/trailing space and tab.
     on_header: ?HeaderFn = null,
     ctx: ?*anyopaque = null,
+    /// Hand the sink a body still in its `content-encoding`, instead of
+    /// refusing it.
+    ///
+    /// Named to be conspicuous in a diff. zurl decodes no content codings, so
+    /// with this set a `gzip` body reaches the sink as gzip -- which is fine
+    /// when the caller is writing it to a file, and is the cAdvisor incident
+    /// rebuilt when the caller is a `LineSink` expecting text.
+    allow_encoded_body: bool = false,
     /// Budget for the status line plus all headers (and, separately reused,
     /// all trailers), counted in raw bytes including line endings.
     max_head_bytes: usize = max_head_bytes_default,
@@ -269,6 +289,15 @@ fn applyFraming(head: *Head, name: []const u8, value: []const u8) Error!void {
             if (prev != n) return error.MalformedHeader;
         }
         head.content_length = n;
+    } else if (std.ascii.eqlIgnoreCase(name, "content-encoding")) {
+        // `identity` means "no coding applied" and is the one value that
+        // needs nothing. Anything else -- including a LIST like "gzip, br",
+        // which is why this is not an equality test against known names --
+        // means the bytes on the wire are not the bytes the caller wants.
+        // Recorded here and refused in `streamBody`, because whether it
+        // matters depends on whether a body is coming at all.
+        const identity = std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "identity");
+        if (!identity and value.len > 0) head.encoded_body = true;
     } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
         if (containsTokenIgnoreCase(value, "chunked")) head.chunked = true;
     } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
@@ -295,7 +324,17 @@ pub fn streamBody(
 ) Error!Body {
     assert(opts.max_head_bytes > 0);
 
+    // Bodyless FIRST, and the order is the whole subtlety. A HEAD response
+    // echoes the headers its GET would have sent, `content-encoding` among
+    // them, while carrying no body -- so refusing on the header alone would
+    // break every HEAD against a gzip-serving origin, and `ycs.head` is a
+    // real caller. Nothing reaches a sink here, so nothing can be misread.
     if (head.bodyless(method)) return .{ .len = 0, .keep_alive = head.keep_alive };
+
+    // Rule 2: the caller never sees an undecoded byte. zurl decodes no
+    // content codings, so the only honest answers are to refuse or to be told
+    // explicitly that raw bytes are wanted.
+    if (head.encoded_body and !opts.allow_encoded_body) return error.UnsupportedContentEncoding;
 
     if (head.chunked) {
         const n = try streamChunked(r, sink, opts);
@@ -679,4 +718,82 @@ test "bare LF line endings are refused in the head, CRLF only" {
         defer out.deinit();
         try t.expectError(want, parseAll(&sr.interface, .GET, &out));
     }
+}
+
+test "a content-encoding this parser cannot decode is refused, not passed through" {
+    // The cAdvisor incident, rebuilt: a body that is not what it claims,
+    // handed to a sink that parses it as text. Nothing here sends
+    // `accept-encoding`, so a compliant origin never does this — but rule 2
+    // says the caller never sees an undecoded byte, and "the server should
+    // not have" is not a framing guarantee.
+    const gzip = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 4\r\n\r\n\x1f\x8b\x08\x00";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(gzip, gzip.len, null, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try t.expectError(error.UnsupportedContentEncoding, parseAll(&sr.interface, .GET, &out));
+    // Refused before delivery: a sink that got half a body and then an error
+    // would still have been handed bytes it cannot read.
+    try t.expectEqualStrings("", out.written());
+
+    // Two SEPARATE content-encoding fields, both orders. `encoded_body` is
+    // monotonic — set, never cleared — so a later `identity` cannot talk the
+    // parser out of a gzip it already saw. Written as a test rather than left
+    // to that argument, because a bypass here is the founding incident.
+    const dup_after = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-encoding: identity\r\ncontent-length: 1\r\n\r\nx";
+    const dup_before = "HTTP/1.1 200 OK\r\ncontent-encoding: identity\r\ncontent-encoding: gzip\r\ncontent-length: 1\r\n\r\nx";
+    for ([_][]const u8{ dup_after, dup_before }) |wire| {
+        var db: [256]u8 = undefined;
+        var ds = SegmentedReader.init(wire, wire.len, null, &db);
+        var dout: Io.Writer.Allocating = .init(t.allocator);
+        defer dout.deinit();
+        try t.expectError(error.UnsupportedContentEncoding, parseAll(&ds.interface, .GET, &dout));
+    }
+
+    // A list is refused too. `gzip, identity` is still gzip on the wire, so
+    // matching known names one at a time would be the wrong test.
+    const list = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip, identity\r\ncontent-length: 1\r\n\r\nx";
+    var b2: [256]u8 = undefined;
+    var s2 = SegmentedReader.init(list, list.len, null, &b2);
+    var o2: Io.Writer.Allocating = .init(t.allocator);
+    defer o2.deinit();
+    try t.expectError(error.UnsupportedContentEncoding, parseAll(&s2.interface, .GET, &o2));
+}
+
+test "identity, a bodyless response, and an opted-in caller all still pass" {
+    // The complement. A check that refuses more than it must is a check people
+    // route around, and each of these is a case a blanket refusal would break.
+
+    // `identity` is the one coding that means "nothing was applied".
+    const identity = "HTTP/1.1 200 OK\r\ncontent-encoding: identity\r\ncontent-length: 2\r\n\r\nhi";
+    var b1: [256]u8 = undefined;
+    var s1 = SegmentedReader.init(identity, identity.len, null, &b1);
+    var o1: Io.Writer.Allocating = .init(t.allocator);
+    defer o1.deinit();
+    _, const body1 = try parseAll(&s1.interface, .GET, &o1);
+    try t.expectEqualStrings("hi", o1.written());
+    try t.expectEqual(@as(u64, 2), body1.len);
+
+    // A HEAD echoes the headers its GET would have sent, `content-encoding`
+    // among them, and carries no body. Refusing it would break every HEAD
+    // against a gzip-serving origin — `ycs.head` is a real caller.
+    const head_resp = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 900\r\n\r\n";
+    var b2: [256]u8 = undefined;
+    var s2 = SegmentedReader.init(head_resp, head_resp.len, null, &b2);
+    var o2: Io.Writer.Allocating = .init(t.allocator);
+    defer o2.deinit();
+    const h2 = try parseHead(&s2.interface, .{});
+    const body2 = try streamBody(&s2.interface, h2, .HEAD, &o2.writer, .{});
+    try t.expectEqual(@as(u64, 0), body2.len);
+    try t.expect(h2.encoded_body);
+
+    // And a caller that says it wants the raw bytes gets them.
+    const raw = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 3\r\n\r\nabc";
+    var b3: [256]u8 = undefined;
+    var s3 = SegmentedReader.init(raw, raw.len, null, &b3);
+    var o3: Io.Writer.Allocating = .init(t.allocator);
+    defer o3.deinit();
+    const h3 = try parseHead(&s3.interface, .{ .allow_encoded_body = true });
+    _ = try streamBody(&s3.interface, h3, .GET, &o3.writer, .{ .allow_encoded_body = true });
+    try t.expectEqualStrings("abc", o3.written());
 }

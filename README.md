@@ -132,12 +132,17 @@ close-delimited, bodyless statuses, `Transfer-Encoding` beating
 `Content-Length`, conflicting `Content-Length` refused. You never see an
 undecoded byte and never choose whether a 204 has a body.
 
+That extends to content codings. zurl decodes none, so a body arriving as
+`gzip` is `error.UnsupportedContentEncoding` rather than compressed bytes
+handed to a sink expecting text. Nothing here sends `accept-encoding`, so a
+compliant origin never triggers it; pass `allow_encoded_body` if the raw bytes
+are what you actually want.
+
 Works identically on `Io.Threaded` and zio — both are production backends for
 its consumers, so a mechanism that only works on one is not a mechanism zurl
 uses.
 
-**Not yet:** redirects are not followed, a `content-encoding` zurl does not
-understand is not yet refused, and no `user-agent` is sent.
+**Not yet:** redirects are not followed and no `user-agent` is sent.
 [docs/SCOPE.md](docs/SCOPE.md) is the list, in the order it will be built, and
 says what is deliberately refused (HTTP/2, cookies, connection pools, signing
 schemes).
@@ -150,12 +155,18 @@ ReleaseFast, 8-core x86_64_v3 Linux, 2026-08-23. Reproduce with
 | shape | ns/resp | throughput |
 |---|---|---|
 | small-cl (8 headers, 128 B body) | 121 | 8.3 M resp/s |
-| zrk-1k (proxy-bench shape, 1 KiB body) | **48** | 20.8 M resp/s, 22.9 GB/s |
+| zrk-1k (proxy-bench shape, 1 KiB body) | **50** | 20.0 M resp/s, 22.4 GB/s |
 | cadvisor (1.5 MiB chunked → `LineSink`) | 0.19 ms/scrape | 8.0 GB/s, 14.7 k lines |
+
+zrk-1k moved 47–48 → 49–51 ns when the `content-encoding` refusal landed:
+one more header-name comparison per field that matches nothing. Five
+interleaved A/B pairs, bands not overlapping, so it is a real cost and not
+noise — reported rather than absorbed. It buys the guarantee that a sink never
+receives bytes it cannot read, for 3 ns on a ~10 µs round trip.
 
 End-to-end against `std.http.Client` on loopback: parity keep-alive
 (syscall-bound), ~1.8× on a fresh connection per request. The parser is not the
-story at the wire — 48 ns inside a ~10 µs round trip is 0.5%.
+story at the wire — 50 ns inside a ~10 µs round trip is 0.5%.
 
 Methodology, the A/B bands behind those figures, and what assertions cost live
 with [rule 8](docs/DESIGN.md); the comparison against std is in
