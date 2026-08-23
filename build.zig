@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Compile-only gate for the executables that are otherwise reachable only
+    // through a run step. CI must fail on a bench/ or smoke/ file that stopped
+    // compiling; it must NOT run them -- benchmark numbers off a shared runner
+    // are not a control (rule 8), and tls-smoke needs a live origin.
+    const check_step = b.step("check", "Compile everything without running it");
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
@@ -17,6 +23,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    check_step.dependOn(&tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
@@ -81,6 +89,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zurl", .module = mod }},
         }),
     });
+    check_step.dependOn(&tls_smoke.step);
+
     const tls_smoke_step = b.step("tls-smoke", "Live TLS handshake against a real origin");
     const tls_smoke_run = b.addRunArtifact(tls_smoke);
     if (b.args) |args| tls_smoke_run.addArgs(args);
@@ -99,6 +109,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "zurl", .module = mod }},
             }),
         });
+        check_step.dependOn(&exe.step);
+
         const step = b.step("bench-" ++ name, "Run the " ++ name ++ " benchmark");
         const run = b.addRunArtifact(exe);
         if (b.args) |args| run.addArgs(args);
