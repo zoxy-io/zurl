@@ -30,8 +30,13 @@ For every slice, in order:
    in 0.15 s, when the parser is what you are editing.
    A new framing shape gets a line in `src/fuzz.zig`'s seed corpus — the
    mutator can only reach what the seeds spell.
-3. **`zig fmt --check src bench build.zig build.zig.zon`** — must be clean.
-4. **Benchmarks.** `zig build bench-parse -Doptimize=ReleaseFast` for anything
+3. **`zig fmt --check src bench smoke build.zig build.zig.zon`** — clean.
+4. **`zig build tls-smoke`** when the change touches `src/tls.zig`,
+   `src/client.zig`, or the transport seam. It is a live gate — a real
+   handshake against a real origin — so it needs network and is deliberately
+   not part of `zig build test`; run it by hand and say in the commit that you
+   did. `-- <url> [bundle|self-signed|insecure]` aims it elsewhere.
+5. **Benchmarks.** `zig build bench-parse -Doptimize=ReleaseFast` for anything
    touching `src/parser.zig` or `src/sink.zig`; `bench-e2e` as well for
    anything touching `src/connection.zig` or `src/client.zig`. Compare *bands*
    across runs, never single numbers, and re-run the baseline in the same
@@ -39,10 +44,10 @@ For every slice, in order:
    control. If the band moved, say so in the commit message and update the
    README table; if a change is advertised as faster, the benchmark line that
    shows it is part of the slice (rule 8).
-5. **Run the `tiger-style-reviewer` agent on the diff.** It is read-only and
+6. **Run the `tiger-style-reviewer` agent on the diff.** It is read-only and
    reviews `git diff HEAD`. Fix the violations; judgement calls are a
    conversation, not an order.
-6. **Then commit** — one commit, descriptive message, *rule N* references
+7. **Then commit** — one commit, descriptive message, *rule N* references
    welcome. Push and open PRs only when asked.
 
 A slice that cannot pass a gate is not "done pending a follow-up"; either the
@@ -51,7 +56,7 @@ gate is wrong (change it deliberately, in its own slice) or the slice is.
 ## Toolchain
 
 Zig **0.16.0** exactly. The repo has no dev shell of its own yet; if `zig` is
-not on `PATH`, use the 0.16.0 toolchain the neighbouring zoxy checkout pins
+not on `PATH`, use the 0.16.0 toolchain the sibling `../zoxy` checkout pins
 (`devenv shell` there, or the `zig-0.16.0` path in the nix store). Do not
 build with 0.15 or with master — `std.Io` moves.
 

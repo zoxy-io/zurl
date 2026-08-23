@@ -42,6 +42,23 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the parser fuzz oracles: corpus, mutations, vacuity");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
+    // The live TLS gate. Deliberately its own step and not part of `test`:
+    // std ships no TLS server, so a real handshake needs a real origin, and a
+    // unit test that fails when DNS is down is a gate people learn to ignore.
+    const tls_smoke = b.addExecutable(.{
+        .name = "tls-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("smoke/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zurl", .module = mod }},
+        }),
+    });
+    const tls_smoke_step = b.step("tls-smoke", "Live TLS handshake against a real origin");
+    const tls_smoke_run = b.addRunArtifact(tls_smoke);
+    if (b.args) |args| tls_smoke_run.addArgs(args);
+    tls_smoke_step.dependOn(&tls_smoke_run.step);
+
     // Benchmarks are executables, not tests: they print numbers and never
     // assert on them — a perf gate that fails on a loaded laptop teaches
     // people to delete perf gates. Run with -Doptimize=ReleaseFast.

@@ -27,12 +27,18 @@ Connection  request/response over an injected *Io.Reader + *Io.Writer —
 fetch       URL in, deadline-bounded Response out; the deadline is a race
             (worker vs sleeper through an Io.Queue), never a poll
 Sink        discard | collect | lines (LineSink) | stream — no "none"
+tls         std.crypto.tls as a TRANSPORT: in a *Io.Reader + *Io.Writer,
+            out a *Io.Reader + *Io.Writer. Trust anchors are the caller's,
+            because loading them allocates and zurl does not
 ```
 
 Works identically on `Io.Threaded` and zio, because both are production
-backends for its consumers. TLS is not in-tree yet: `fetch` refuses https
-(`error.TlsNotImplemented`); a `std.crypto.tls` transport adapter is the v1
-item, and the transport seam is already the API.
+backends for its consumers. https works through the same seam: `fetch` takes a
+`tls` config carrying caller-owned trust anchors, splices a
+`std.crypto.tls.Client` into the transport, and `Connection` cannot tell the
+difference. There is no default trust store on purpose — building one
+allocates, and a caller who silently got "verify nothing" would have an https
+URL that looks secure and is not.
 
 ## Numbers
 
@@ -87,8 +93,16 @@ Two conclusions worth stating plainly:
 - [x] Connection over injected transports, keep-alive bookkeeping
 - [x] deadline-bounded fetch (DNS via `HostName.connect`, plain HTTP)
 - [x] parse + e2e benchmarks
-- [ ] TLS transport adapter over `std.crypto.tls` (then: point the zoxy
-      benchmark's control plane at zurl and delete its std wrapper)
+- [x] TLS transport adapter over `std.crypto.tls` — `src/tls.zig`, one
+      adapter and no branch anywhere above it. Verified live by
+      `zig build tls-smoke`, which is a separate step because std ships no TLS
+      server and a unit test that needs DNS is a gate people learn to ignore:
+      example.com matches `curl` byte for byte (200, 559 bytes), google.com
+      moves 89 KB of chunked body through it, and expired / wrong-host /
+      self-signed / untrusted-root all come back `TlsCertificateInvalid` with
+      std's precise reason available through `tls.Diagnostics`.
+- [ ] point the zoxy benchmark's control plane at zurl and delete its std
+      wrapper
 - [ ] zio-backend run of bench-e2e (numbers above are `Io.Threaded`)
 - [x] fuzz the parser — `zig build fuzz`, with design rule 4 as the oracle.
       The same bytes parsed whole, at a split, and one byte per read must give

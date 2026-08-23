@@ -105,6 +105,10 @@ loop of a load generator may simply never be the right consumer.
 ## Non-goals (v0)
 
 HTTP/2 (nothing in either repo speaks it as a client), redirects, cookies,
-connection pools, request-side chunked bodies, TLS *in-tree* (rule 5 gives it
-a seam; a `std.crypto.tls` transport adapter is the obvious v1 item, and
-`fetch` returns `error.TlsNotImplemented` for https until then).
+connection pools, request-side chunked bodies.
+
+TLS is no longer among them, and the way it landed is the rule working:
+`src/tls.zig` is an adapter that turns one `*Io.Reader`/`*Io.Writer` pair into
+another, `Connection` is unchanged, and a consumer that prefers zrk's ztls
+still hands `Connection` its own two pointers and never compiles the file.
+The trust anchors stay the caller's — loading them allocates.

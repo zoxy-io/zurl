@@ -15,6 +15,10 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        // build.zig declares steps that reference these, so a dependent
+        // resolving those lazy paths needs them in the package.
+        "bench",
+        "smoke",
         "README.md",
     },
 }

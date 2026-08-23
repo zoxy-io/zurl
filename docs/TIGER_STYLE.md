@@ -27,6 +27,13 @@ say *what must be true*. Neither overrides the other.
   `Io.Writer.Allocating` — the caller's allocator, chosen at the caller's call
   site, freed by the caller's `deinit`. A new `Allocator` parameter anywhere
   under `src/` is a design change, not a refactor.
+  **The one that has been made**, so it is not re-litigated: `tls.Ca.Bundle`
+  carries a `gpa` through `src/tls.zig` to std's certificate verifier, which
+  allocates during the handshake. It is the caller's allocator, on the
+  caller's bundle, for the caller's trust store — the alternative was zurl
+  loading a trust store itself, which is strictly more allocation and takes
+  the decision away from the process that should own it. The rule still binds
+  everywhere else, and nothing else in `src/` names an `Allocator`.
   Corollary: **every buffer is the caller's, and every buffer is a bound.**
   A `[]u8` parameter is the limit on whatever it holds, and its doc comment
   says what it bounds (`carry` bounds the longest deliverable line).
@@ -42,10 +49,16 @@ say *what must be true*. Neither overrides the other.
   `lint:unbounded-ok — <why>` marker convention is kept anyway: it is for the
   reader.
 - **The transport seam replaces zoxy's boundary lints.** Nothing under `src/`
-  may import a socket, a TLS stack, or a runtime. `Connection` is a
-  `*Io.Reader` + `*Io.Writer` (rule 5) and `client.zig` is the only file that
-  is allowed to dial. A TLS implementation arrives as a transport that
-  produces those two pointers, never as a branch inside the parser.
+  may import a socket, a TLS stack, or a runtime, with exactly two named
+  exceptions: `client.zig` is the only file allowed to dial, and `tls.zig` is
+  the only file allowed to import `std.crypto.tls`. Both are *adapters at the
+  seam* rather than users of it — nothing else in `src/` imports either, and
+  `Connection` cannot tell a TLS transport from a socket or from a pair of
+  fixed buffers in a test. A TLS implementation arrives as a transport that
+  produces those two pointers, never as a branch inside the parser; a
+  consumer that prefers zrk's ztls hands `Connection` its own two pointers and
+  never compiles `tls.zig` at all. Adding a third exception needs the same
+  argument these two made.
 
 ## Non-negotiables
 

@@ -71,11 +71,22 @@ pub const Connection = struct {
     reusable: bool = true,
 
     pub fn init(in: *Io.Reader, out: *Io.Writer) Connection {
-        // Both buffers belong to whoever owns the transport, and both are
-        // bounds: `in` limits the longest head line the parser can ever see,
-        // `out` the request that can be written without a flush.
+        // The reader's buffer is a real bound — it limits the longest head
+        // line the parser can ever see, and a zero-length one fails every
+        // response for a reason that has nothing to do with the response.
         assert(in.buffer.len > 0);
-        assert(out.buffer.len > 0);
+        // `out` gets no length assertion: zero means "unbuffered", which is a
+        // legitimate choice, and the TLS transport's writer is exactly that.
+        // An earlier assertion here forbade it — a claim about what had not
+        // happened yet rather than about what cannot.
+        //
+        // What IS still an invariant is the thing that actually broke. std
+        // documents a zero-length buffer as making the DEFAULT flush a no-op,
+        // so an unbuffered writer that kept it would silently swallow
+        // `writeRequest`'s closing flush and the request would never reach the
+        // wire — which is precisely how the TLS transport first failed, as an
+        // UnexpectedEof out of the parser.
+        if (out.buffer.len == 0) assert(out.vtable.flush != Io.Writer.defaultFlush);
 
         return .{ .in = in, .out = out };
     }
