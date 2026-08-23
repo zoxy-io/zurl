@@ -12,6 +12,10 @@ Read before writing code:
   allocation, ≤ 70-line functions, assertion density ≥ 2, bounded loops,
   explicitly-sized integers, naming, and the deltas from zoxy's version. This
   is *how it is written*.
+- [docs/SCOPE.md](docs/SCOPE.md) — which client features zurl owns, which are
+  the caller's, and which are refused, drawn against the consumer that exists.
+  This is *how far it goes*. A feature not in a tier here needs an argument
+  before it needs code.
 - [docs/RESEARCH.md](docs/RESEARCH.md) — what exists in the ecosystem and why
   none of it fits. Do not re-litigate a verdict recorded here; add to it when
   a new one is reached.

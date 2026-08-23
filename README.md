@@ -9,8 +9,10 @@ text for months.
 
 Every one of those is a design rule here. **Start with
 [docs/DESIGN.md](docs/DESIGN.md)** (the eight rules, each traceable to an
-incident) and [docs/RESEARCH.md](docs/RESEARCH.md) (what exists in the
-ecosystem and why none of it fits). How it is written and how a change
+incident), then [docs/SCOPE.md](docs/SCOPE.md) (which client features are in,
+which are the caller's, and which are refused) and
+[docs/RESEARCH.md](docs/RESEARCH.md) (what exists in the ecosystem and why none
+of it fits). How it is written and how a change
 lands: [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) and [CLAUDE.md](CLAUDE.md).
 
 Private while it is an experiment. Zig 0.16.0; one dependency,
@@ -115,8 +117,24 @@ Two conclusions worth stating plainly:
       moves 89 KB of chunked body through it, and expired / wrong-host /
       self-signed / untrusted-root all come back `TlsCertificateInvalid` with
       std's precise reason available through `tls.Diagnostics`.
+- [ ] **Tier 1** ([docs/SCOPE.md](docs/SCOPE.md)) — what the control-plane swap
+      needs before it is safe, in the order the risk sits:
+  - [ ] response headers reachable from `fetch`. `Response` is
+        `{status, body_len}` and `on_header` was never passed through, so
+        `Retry-After` is unreachable and `discord.post` *guesses* its 429
+        backoff today
+  - [ ] `content-encoding`: decode or refuse, never pass through. A server that
+        gzips unasked currently hands compressed bytes to `LineSink`, which
+        parses them as text — the cAdvisor incident, rebuilt
+  - [ ] redirects, `max_redirects = 0` by default, with cross-origin
+        `authorization` stripped structurally (the harness carries a live IAM
+        bearer token)
+  - [ ] a default `user-agent`, and percent-encoding for URL building — `ycs`
+        interpolates bucket keys with `{s}` and no escaping
 - [ ] point the zoxy benchmark's control plane at zurl and delete its std
-      wrapper
+      wrapper. Blocked on Tier 1: `std.http.Client` follows redirects silently
+      today, so swapping in a client that does not would turn a followed 302
+      into a reported benchmark failure
 - [ ] zio-backend run of bench-e2e (numbers above are `Io.Threaded`)
 - [x] fuzz the parser — `zig build fuzz`, with design rule 4 as the oracle.
       The same bytes parsed whole, at a split, and one byte per read must give

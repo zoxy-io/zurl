@@ -126,8 +126,20 @@ loop of a load generator may simply never be the right consumer.
 
 ## Non-goals (v0)
 
-HTTP/2 (nothing in either repo speaks it as a client), redirects, cookies,
-connection pools, request-side chunked bodies.
+HTTP/2 (nothing in either repo speaks it as a client), cookies, connection
+pools inside `fetch`, multipart, signing schemes.
+
+Two things left this list once the consumer was actually surveyed, and
+[docs/SCOPE.md](SCOPE.md) carries the reasoning and the tiers:
+
+* **Redirects** are in scope, `max_redirects = 0` by default. `std.http.Client`
+  follows them silently today, so a client that does not would turn a followed
+  302 into a reported benchmark failure. Off by default makes that loud in one
+  run instead of silent; cross-origin redirects drop `authorization`
+  structurally, because the harness carries a live IAM bearer token.
+* **Request-side chunked bodies** are in scope for uploads. The v0 argument was
+  that nothing needed them, and artifact PUTs holding a whole file in memory
+  are what changed it.
 
 TLS is no longer among them, and the way it landed is the rule working:
 `src/tls.zig` is an adapter that turns one `*Io.Reader`/`*Io.Writer` pair into
