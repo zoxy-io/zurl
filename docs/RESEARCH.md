@@ -55,6 +55,90 @@ anyway — the deadline layer being most of what our incidents were about. Worth
 watching; not worth adopting today. If zurl's parser benches poorly, dusty's
 llhttp numbers are the thing to compare against before writing a SIMD parser.
 
+### zoxy-io/hparse — measured, and the measurement changed the question
+
+Reproduce: `zig build bench-head -Dhparse -Doptimize=ReleaseFast`.
+
+hparse is a zero-allocation SIMD head parser we already own and already ship
+inside zoxy. The question was whether zurl should take it as a dependency; the
+measurement answered a more useful one.
+
+**hparse's scanner is genuinely faster than ours.** Decomposed by header count
+(ns/head, contiguous input, ReleaseFast; `raw` is `parseResponse` alone,
+`full` adds the framing pass over the array it fills):
+
+| headers | zurl | hparse raw | hparse full |
+|---|---|---|---|
+| 0 (status line only) | 16–17 | **2** | **2** |
+| 1 | 31–32 | **4** | **11** |
+| 8 | 116–119 | **73–79** | **93–97** |
+| 16 | 194–196 | 175–176 | 204 |
+| 64 | **656–698** | 688–692 | 758–763 |
+
+Fitted: zurl ≈ 35 ns + 10.0 ns/header; hparse+framing ≈ 18 ns + 11.6 ns/header.
+So hparse wins on fixed cost — a bare status line is **8× cheaper**, 2 ns
+against 17, because it is pointer arithmetic and magic-integer compares on a
+contiguous slice rather than `Io.Reader` vtable calls — and loses slightly on
+slope, crossing over around ten headers. Its higher per-header cost is not
+inefficiency: it validates every byte against RFC token tables (`key_map`,
+`value_map`), which **our parser does not do at all**. See the open question
+below.
+
+**The problem is the API, and it is not zurl's problem.** hparse parses a
+CONTIGUOUS slice and returns `error.Incomplete`, so a streaming caller must
+re-parse from byte zero every time more bytes arrive. Head parsing becomes
+O(N²) in the number of segments:
+
+| delivery | small-cl | many-hdr (30 headers) |
+|---|---|---|
+| whole buffered | zurl 171 / hparse 124 | zurl 361 / hparse 399 |
+| 64-byte segments | zurl 161 / hparse 250 | zurl 590 / hparse **4176** |
+| 1-byte segments | zurl 1354 / hparse 8990 | zurl 7844 / hparse **250702** |
+
+Scanning for `\r\n\r\n` first and parsing once (`hparse+scan`) removes the
+blowup and lands at a tie or worse, because that scan is a second linear pass
+over the head — and finding the line ends IS zurl's parse, so we never pay it.
+
+**This matters far more to zoxy than to zurl.** zoxy's `src/http/parser.zig`
+documents the same pattern in its own words: *"a partial head returns
+`error.Incomplete` and the caller re-parses from byte 0 once more bytes
+arrive"*. Measured against zoxy's own limits, one request head, with the
+attacker choosing the segmentation:
+
+| head | segment | parses | bytes scanned | CPU/head | amplification |
+|---|---|---|---|---|---|
+| 8 KiB (default) | 1 B | 8,858 | 39 MB | **8.4 ms** | 4,430× |
+| 8 KiB | 64 B | 139 | 623 KB | 131 µs | 70× |
+| 64 KiB | 1 B | 66,218 | **2.19 GB** | **371 ms** | 33,110× |
+
+Because zoxy is single-writer-per-loop-thread, that burn happens *inside the
+event loop* and stalls every connection on that thread. Slow-loris normally
+costs a socket, which the shed ladder is built for; this costs CPU, which no
+rung catches. It is the family of zoxy#222 — burn instead of shed.
+
+The fix is in hparse, not in its callers: a resume cursor (offset + headers
+already filled + whether the request line is done) so an incomplete parse
+continues where it stopped instead of restarting. `parseHeaders` already fails
+at clean line boundaries, so the resume point exists; it just is not reported.
+
+**Verdict for zurl: not yet, and for reasons that are now secondary.** Even at
+its best hparse saves ~15–30 ns of fixed cost, which is 0.2–0.3% of a 10 µs
+round trip; it needs a caller-supplied `[]Header` array with a
+`TooManyHeaders` failure zurl's callback API does not have; it cannot express
+`HeadTooLong` for a head larger than the buffer, because a contiguous-slice
+parser has no equivalent of `takeDelimiterInclusive`'s `StreamTooLong`; and it
+is strictly CRLF-only, so a bare-LF head that zurl parses today becomes
+`MalformedHeader`. That strictness is *right for an intermediary* — two
+parsers disagreeing about where a line ends is request smuggling — and wrong
+for a client, where it turns a lenient origin into an outage. Revisit if the
+resume cursor lands.
+
+**Open question against ourselves:** hparse validates header name and value
+bytes; `src/parser.zig` does not. A header name containing a control
+character or a space parses fine here today. RFC 9110 says field names are
+tokens, and rule 2 is otherwise strict about exactly this class of thing. Part
+of our per-header advantage above is bought by that omission.
+
 ### The rest
 
 * **zio** — not a client; the runtime everything must run on unmodified.

@@ -10,7 +10,26 @@
     // async runtime or TLS pin into that graph would make every bump a
     // three-way agreement. Anything backend-specific (zio, a TLS stack) enters
     // through std.Io and the transport parameter, never through this file.
-    .dependencies = .{},
+    // TEMPORARY, lazy, and reachable only through `-Dhparse`. zurl ships zero
+    // dependencies (DESIGN.md rule 6) and this pin does not change that: it is
+    // marked lazy, so nothing fetches it unless the experiment is asked for,
+    // and nothing under src/ imports it — the comparison lives in bench/.
+    //
+    // It exists to settle one question with a number instead of an argument
+    // (rule 8): would zoxy-io/hparse's SIMD head parser be worth the
+    // dependency? docs/RESEARCH.md carries the verdict. When that verdict is
+    // acted on, this entry either moves into the real dependency set or is
+    // deleted; it is not meant to sit here.
+    //
+    // The ref is the one zoxy audits and pins — its DESIGN.md §7 hardening
+    // gate (PR #3: CRLF-only line terminators + extension-method tokens).
+    .dependencies = .{
+        .hparse = .{
+            .url = "git+https://github.com/zoxy-io/hparse#65521edfc09f19c5574a3360e2ce236c6dbc3be3",
+            .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

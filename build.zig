@@ -42,6 +42,33 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the parser fuzz oracles: corpus, mutations, vacuity");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
+    // The hparse comparison: a temporary experiment, off by default, whose
+    // whole purpose is to answer "would that dependency pay for itself?" with
+    // a measurement. Nothing under src/ imports hparse — the prototype head
+    // parser lives in bench/head.zig — so the library stays a leaf package
+    // whichever way the answer goes.
+    const hparse_step = b.step("bench-head", "Compare head parsers with hparse (needs -Dhparse)");
+    const hparse_enabled = b.option(bool, "hparse", "Enable the temporary hparse comparison") orelse false;
+    if (!hparse_enabled) {
+        hparse_step.dependOn(&b.addFail("bench-head needs -Dhparse (see docs/RESEARCH.md)").step);
+    } else if (b.lazyDependency("hparse", .{ .target = target, .optimize = optimize })) |hparse_dep| {
+        const exe = b.addExecutable(.{
+            .name = "bench-head",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/head.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zurl", .module = mod },
+                    .{ .name = "hparse", .module = hparse_dep.module("hparse") },
+                },
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        if (b.args) |args| run.addArgs(args);
+        hparse_step.dependOn(&run.step);
+    }
+
     // The live TLS gate. Deliberately its own step and not part of `test`:
     // std ships no TLS server, so a real handshake needs a real origin, and a
     // unit test that fails when DNS is down is a gate people learn to ignore.
