@@ -1,0 +1,20 @@
+.{
+    .name = .zurl,
+    .version = "0.0.0",
+    .fingerprint = 0x2ef103580a0b50f9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    // ZERO dependencies, deliberately. zurl is std-only so that it is a LEAF
+    // package: the zoxy-benchmark repo already documents how two copies of zio
+    // fail to unify across a module boundary ("file exists in modules
+    // 'zio_options' and 'zio_options0'"), and a client that dragged its own
+    // async runtime or TLS pin into that graph would make every bump a
+    // three-way agreement. Anything backend-specific (zio, a TLS stack) enters
+    // through std.Io and the transport parameter, never through this file.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

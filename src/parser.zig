@@ -1,0 +1,432 @@
+//! HTTP/1.x response parsing: a head, then framed body delivery to a sink.
+//!
+//! The parser owns framing entirely (docs/DESIGN.md rule 2). The caller never
+//! sees an undecoded byte: content-length bodies, chunked bodies (including
+//! trailers) and close-delimited bodies all arrive at the sink as the same
+//! logical byte stream. This is the property whose absence cost the zoxy
+//! benchmark months of silently corrupted cAdvisor scrapes.
+//!
+//! Zero allocation, by construction rather than effort: nothing here takes an
+//! allocator. Head lines are parsed in place inside the reader's buffer;
+//! bodies stream through `Io.Reader.streamExact64`/`streamRemaining` without
+//! ever being held whole.
+
+const std = @import("std");
+const Io = std.Io;
+
+pub const Error = error{
+    MalformedStatusLine,
+    MalformedHeader,
+    MalformedChunk,
+    /// A head (or trailer) line exceeded the reader's buffer, or the head as a
+    /// whole exceeded `max_head_bytes`. Never truncated (rule 7): the caller
+    /// gets an error, not a clipped header.
+    HeadTooLong,
+    UnexpectedEof,
+    ReadFailed,
+    /// The SINK failed, not the transport. Distinct on purpose: a full collect
+    /// buffer and a dead connection demand different reactions.
+    WriteFailed,
+};
+
+pub const Head = struct {
+    status: u16,
+    /// The status line began "HTTP/1.1". Decides the keep-alive default.
+    http11: bool,
+    /// What the head SAID. The final verdict is `Body.keep_alive`, because a
+    /// close-delimited body forces false regardless of any header.
+    keep_alive: bool,
+    content_length: ?u64 = null,
+    chunked: bool = false,
+
+    /// RFC 9112 §6.3: HEAD responses and 1xx/204/304 statuses never carry a
+    /// body, whatever Content-Length or Transfer-Encoding claim. Consuming a
+    /// body there eats into the next response and breaks framing — this is
+    /// ziglang/zig#25181, open at `urgent` in std.http.Client today.
+    pub fn bodyless(h: Head, method: std.http.Method) bool {
+        return method == .HEAD or h.status / 100 == 1 or h.status == 204 or h.status == 304;
+    }
+};
+
+/// Slices are valid ONLY for the duration of the call — they point into the
+/// reader's buffer, which the body stream will overwrite.
+pub const HeaderFn = *const fn (ctx: ?*anyopaque, name: []const u8, value: []const u8) void;
+
+pub const HeadOptions = struct {
+    /// Called once per header line, and again for chunked trailers. Names are
+    /// as sent; values are trimmed of leading/trailing space and tab.
+    on_header: ?HeaderFn = null,
+    ctx: ?*anyopaque = null,
+    /// Budget for the status line plus all headers (and, separately reused,
+    /// all trailers), counted in raw bytes including line endings.
+    max_head_bytes: usize = 64 * 1024,
+};
+
+pub const Body = struct {
+    len: u64,
+    /// The connection's fate: the head's verdict, downgraded to false when the
+    /// body ran to connection close (nothing further can be framed).
+    keep_alive: bool,
+};
+
+/// Read the status line and headers, through the blank line.
+///
+/// The reader's buffer bounds the longest single line; `max_head_bytes` bounds
+/// the head as a whole, so a server spewing endless valid-sized header lines
+/// still terminates.
+pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
+    var budget = opts.max_head_bytes;
+
+    const status_line = try takeLine(r, &budget);
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.")) return error.MalformedStatusLine;
+    const http11 = std.mem.startsWith(u8, status_line, "HTTP/1.1");
+
+    // "HTTP/1.1 200 OK" — the token after the first space, exactly three
+    // digits (RFC 9112 §4), so every status lands in a 1xx..5xx class bucket.
+    const first_space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return error.MalformedStatusLine;
+    const after = status_line[first_space + 1 ..];
+    const code_end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+    const status = std.fmt.parseInt(u16, after[0..code_end], 10) catch return error.MalformedStatusLine;
+    if (status < 100 or status > 999) return error.MalformedStatusLine;
+
+    var head: Head = .{
+        .status = status,
+        .http11 = http11,
+        // HTTP/1.1 defaults to keep-alive; 1.0 defaults to close.
+        .keep_alive = http11,
+    };
+
+    while (true) {
+        const line = try takeLine(r, &budget);
+        if (line.len == 0) break;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
+        const name = line[0..colon];
+        if (name.len == 0) return error.MalformedHeader;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            const n = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHeader;
+            if (head.content_length) |prev| {
+                // Duplicate Content-Length: equal copies are tolerated (some
+                // proxies stack them), a DISAGREEMENT is the request-smuggling
+                // primitive and is refused outright.
+                if (prev != n) return error.MalformedHeader;
+            }
+            head.content_length = n;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            if (containsTokenIgnoreCase(value, "chunked")) head.chunked = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            if (containsTokenIgnoreCase(value, "close")) {
+                head.keep_alive = false;
+            } else if (containsTokenIgnoreCase(value, "keep-alive")) {
+                head.keep_alive = true;
+            }
+        }
+
+        if (opts.on_header) |f| f(opts.ctx, name, value);
+    }
+
+    return head;
+}
+
+/// Deliver the body (decoded, if chunked) to `sink`, per the head's framing.
+///
+/// Precedence is RFC 9112 §6.3: Transfer-Encoding beats Content-Length —
+/// when both are present the length header is a lie or an attack, and the
+/// chunked framing is what the wire actually carries. Bodyless heads consume
+/// nothing regardless of either header.
+pub fn streamBody(
+    r: *Io.Reader,
+    head: Head,
+    method: std.http.Method,
+    sink: *Io.Writer,
+    opts: HeadOptions,
+) Error!Body {
+    if (head.bodyless(method)) return .{ .len = 0, .keep_alive = head.keep_alive };
+
+    if (head.chunked) {
+        const n = try streamChunked(r, sink, opts);
+        return .{ .len = n, .keep_alive = head.keep_alive };
+    }
+    if (head.content_length) |len| {
+        r.streamExact64(sink, len) catch |err| return switch (err) {
+            error.EndOfStream => error.UnexpectedEof,
+            error.ReadFailed => error.ReadFailed,
+            error.WriteFailed => error.WriteFailed,
+        };
+        return .{ .len = len, .keep_alive = head.keep_alive };
+    }
+
+    // No framing information: the body runs to connection close, which is
+    // itself the reason the connection cannot be kept alive.
+    const n = r.streamRemaining(sink) catch |err| return switch (err) {
+        error.ReadFailed => error.ReadFailed,
+        error.WriteFailed => error.WriteFailed,
+    };
+    return .{ .len = n, .keep_alive = false };
+}
+
+fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
+    var total: u64 = 0;
+    while (true) {
+        var size_budget: usize = 1024; // a chunk-size line is a hex number and maybe extensions
+        const size_line = takeLine(r, &size_budget) catch return error.MalformedChunk;
+        // Size is hex, optionally followed by ";extensions" (ignored).
+        const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+        const size = std.fmt.parseInt(u64, std.mem.trim(u8, size_line[0..semi], " \t"), 16) catch
+            return error.MalformedChunk;
+
+        if (size == 0) {
+            // Trailers: header lines until a blank line, delivered through the
+            // same callback as headers, under a fresh head-sized budget.
+            var budget = opts.max_head_bytes;
+            while (true) {
+                const line = takeLine(r, &budget) catch return error.MalformedChunk;
+                if (line.len == 0) return total;
+                if (opts.on_header) |f| {
+                    const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                    f(opts.ctx, line[0..colon], std.mem.trim(u8, line[colon + 1 ..], " \t"));
+                }
+            }
+        }
+
+        r.streamExact64(sink, size) catch |err| return switch (err) {
+            error.EndOfStream => error.MalformedChunk,
+            error.ReadFailed => error.ReadFailed,
+            error.WriteFailed => error.WriteFailed,
+        };
+        total += size;
+
+        // Each chunk's data is followed by CRLF — and by exactly that. The
+        // hand-rolled reader this replaces ignored the line's content, which
+        // let a desynchronised stream limp on to a stranger error later.
+        var crlf_budget: usize = 8;
+        const crlf = takeLine(r, &crlf_budget) catch return error.MalformedChunk;
+        if (crlf.len != 0) return error.MalformedChunk;
+    }
+}
+
+/// One head/trailer line: CRLF-terminated (bare LF tolerated), returned
+/// without the terminator, charged against `budget` at its raw on-wire size.
+fn takeLine(r: *Io.Reader, budget: *usize) Error![]const u8 {
+    const raw = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.StreamTooLong => return error.HeadTooLong,
+        error.EndOfStream => return error.UnexpectedEof,
+        error.ReadFailed => return error.ReadFailed,
+    };
+    if (raw.len > budget.*) return error.HeadTooLong;
+    budget.* -= raw.len;
+    var line = raw;
+    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
+    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    return line;
+}
+
+/// Whether a comma-separated header value contains `token`, ASCII
+/// case-insensitively, as a whole token rather than a substring — "close"
+/// must not match a hypothetical "not-close".
+fn containsTokenIgnoreCase(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// tests
+
+const t = std.testing;
+
+/// Serves a canned byte stream in caller-chosen segments: `stream` never
+/// crosses the next boundary, so the parser sees the same bytes under every
+/// possible transport segmentation. This is the harness behind design rule 4.
+const SegmentedReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    /// Serve at most this many bytes per `stream` call.
+    max_seg: usize,
+    /// Additionally never cross this absolute offset (a single "packet
+    /// boundary"); 0 disables.
+    boundary: usize = 0,
+    interface: Io.Reader,
+
+    fn init(data: []const u8, max_seg: usize, boundary: usize, buffer: []u8) SegmentedReader {
+        return .{
+            .data = data,
+            .max_seg = max_seg,
+            .boundary = boundary,
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const s: *SegmentedReader = @alignCast(@fieldParentPtr("interface", r));
+        if (s.pos >= s.data.len) return error.EndOfStream;
+        var n = limit.minInt(@min(s.max_seg, s.data.len - s.pos));
+        if (s.boundary > s.pos and s.boundary < s.pos + n) n = s.boundary - s.pos;
+        if (n == 0) return error.EndOfStream;
+        try w.writeAll(s.data[s.pos..][0..n]);
+        s.pos += n;
+        return n;
+    }
+};
+
+fn parseAll(reader: *Io.Reader, method: std.http.Method, out: *Io.Writer.Allocating) !struct { Head, Body } {
+    const head = try parseHead(reader, .{});
+    const body = try streamBody(reader, head, method, &out.writer, .{});
+    return .{ head, body };
+}
+
+test "content-length body, plain" {
+    const wire = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    const head, const body = try parseAll(&sr.interface, .GET, &out);
+    try t.expectEqual(@as(u16, 200), head.status);
+    try t.expect(head.keep_alive and body.keep_alive);
+    try t.expectEqual(@as(u64, 5), body.len);
+    try t.expectEqualStrings("hello", out.written());
+}
+
+test "chunked body reassembles across chunk boundaries, with trailers" {
+    const wire = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n" ++
+        "4\r\nWiki\r\n5\r\npedia\r\n0\r\nx-trailer: yes\r\n\r\n";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    const head, const body = try parseAll(&sr.interface, .GET, &out);
+    try t.expect(head.chunked);
+    try t.expectEqual(@as(u64, 9), body.len);
+    try t.expectEqualStrings("Wikipedia", out.written());
+}
+
+test "segmentation invariance: every split point and byte-at-a-time" {
+    // The property the cAdvisor bug violated: the parse result is a function
+    // of the bytes, never of where the transport split them. Chunk framing is
+    // deliberately positioned so splits land inside the size line, inside the
+    // CRLFs, and inside chunk data.
+    const wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-A: b\r\n\r\n" ++
+        "6\r\nmetric\r\nb;ext=1\r\n_total 42.5\r\n0\r\n\r\n";
+    const want = "metric_total 42.5";
+
+    // Every two-segment split.
+    var split: usize = 1;
+    while (split < wire.len) : (split += 1) {
+        var buf: [256]u8 = undefined;
+        var sr = SegmentedReader.init(wire, wire.len, split, &buf);
+        var out: Io.Writer.Allocating = .init(t.allocator);
+        defer out.deinit();
+        _, const body = try parseAll(&sr.interface, .GET, &out);
+        try t.expectEqual(@as(u64, want.len), body.len);
+        try t.expectEqualStrings(want, out.written());
+    }
+
+    // One byte per read — every boundary at once.
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire, 1, 0, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    _, const body = try parseAll(&sr.interface, .GET, &out);
+    try t.expectEqualStrings(want, out.written());
+    try t.expectEqual(@as(u64, want.len), body.len);
+}
+
+test "bodyless: 204 with keep-alive does not hang, and HEAD ignores content-length" {
+    // ziglang/zig#25181 is exactly this shape hanging in std.http.Client.
+    const wire204 = "HTTP/1.1 204 No Content\r\n\r\n" ++ "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire204, wire204.len, 0, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+
+    _, const b1 = try parseAll(&sr.interface, .GET, &out);
+    try t.expectEqual(@as(u64, 0), b1.len);
+    try t.expect(b1.keep_alive);
+    // The very next bytes must parse as the next response — proof nothing of
+    // the 204 "body" was consumed.
+    const h2, const b2 = try parseAll(&sr.interface, .GET, &out);
+    try t.expectEqual(@as(u16, 200), h2.status);
+    try t.expectEqual(@as(u64, 2), b2.len);
+
+    const head_wire = "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n";
+    var sr2 = SegmentedReader.init(head_wire, head_wire.len, 0, &buf);
+    var out2: Io.Writer.Allocating = .init(t.allocator);
+    defer out2.deinit();
+    _, const hb = try parseAll(&sr2.interface, .HEAD, &out2);
+    try t.expectEqual(@as(u64, 0), hb.len);
+}
+
+test "transfer-encoding beats content-length; conflicting lengths are refused" {
+    const smuggle = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n" ++
+        "2\r\nab\r\n0\r\n\r\n";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(smuggle, smuggle.len, 0, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    _, const body = try parseAll(&sr.interface, .GET, &out);
+    try t.expectEqualStrings("ab", out.written()); // chunked won; CL ignored
+
+    const conflict = "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ncontent-length: 5\r\n\r\n";
+    var sr2 = SegmentedReader.init(conflict, conflict.len, 0, &buf);
+    try t.expectError(error.MalformedHeader, parseHead(&sr2.interface, .{}));
+    _ = body;
+}
+
+test "close-delimited body forces keep_alive false" {
+    const wire = "HTTP/1.0 200 OK\r\n\r\nrest of stream";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var out: Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    const head, const body = try parseAll(&sr.interface, .GET, &out);
+    try t.expect(!head.http11);
+    try t.expect(!body.keep_alive);
+    try t.expectEqualStrings("rest of stream", out.written());
+}
+
+test "connection tokens match whole tokens, not substrings" {
+    try t.expect(containsTokenIgnoreCase("Keep-Alive, Upgrade", "keep-alive"));
+    try t.expect(!containsTokenIgnoreCase("not-close", "close"));
+    try t.expect(containsTokenIgnoreCase("close", "CLOSE"));
+}
+
+test "head budget terminates an endless-header server" {
+    // Valid-sized lines forever: the line length never trips the reader
+    // buffer, so only max_head_bytes stands between us and spinning forever.
+    var wire: [4096]u8 = undefined;
+    var w: Io.Writer = .fixed(&wire);
+    w.writeAll("HTTP/1.1 200 OK\r\n") catch unreachable;
+    for (0..100) |_| w.writeAll("x-h: aaaaaaaaaaaaaaaaaaaaaaaaaa\r\n") catch unreachable;
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(w.buffered(), wire.len, 0, &buf);
+    try t.expectError(error.HeadTooLong, parseHead(&sr.interface, .{ .max_head_bytes = 512 }));
+}
+
+test "headers are delivered through the callback with trimmed values" {
+    const Ctx = struct {
+        seen: usize = 0,
+        fn on(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (std.ascii.eqlIgnoreCase(name, "x-spaced")) {
+                std.testing.expectEqualStrings("v", value) catch unreachable;
+                self.seen += 1;
+            }
+        }
+    };
+    const wire = "HTTP/1.1 200 OK\r\nx-spaced:   v  \r\ncontent-length: 0\r\n\r\n";
+    var buf: [256]u8 = undefined;
+    var sr = SegmentedReader.init(wire, wire.len, 0, &buf);
+    var ctx: Ctx = .{};
+    _ = try parseHead(&sr.interface, .{ .on_header = Ctx.on, .ctx = &ctx });
+    try t.expectEqual(@as(usize, 1), ctx.seen);
+}
