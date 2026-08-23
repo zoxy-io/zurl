@@ -33,6 +33,7 @@ pub const Sink = conn_mod.Sink;
 pub const Header = conn_mod.Header;
 pub const writeRequest = conn_mod.writeRequest;
 pub const RequestError = conn_mod.RequestError;
+pub const default_user_agent = conn_mod.default_user_agent;
 pub const validateTarget = conn_mod.validateTarget;
 
 pub const tls = @import("tls.zig");

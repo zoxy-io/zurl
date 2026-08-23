@@ -167,10 +167,11 @@ Works identically on `Io.Threaded` and zio — both are production backends for
 its consumers, so a mechanism that only works on one is not a mechanism zurl
 uses.
 
-**Not yet:** no `user-agent` is sent.
-[docs/SCOPE.md](docs/SCOPE.md) is the list, in the order it will be built, and
-says what is deliberately refused (HTTP/2, cookies, connection pools, signing
-schemes).
+Requests carry `user-agent: zurl/0.0.0` unless you set `user_agent` yourself
+(or null it, if you send your own).
+
+[docs/SCOPE.md](docs/SCOPE.md) lists what is next and what is deliberately
+refused (HTTP/2, cookies, connection pools, signing schemes).
 
 ## Numbers
 

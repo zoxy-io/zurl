@@ -13,6 +13,18 @@ const LineSink = @import("sink.zig").LineSink;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+/// What zurl calls itself when the caller does not say otherwise.
+///
+/// Sent because its ABSENCE is a failure a caller cannot diagnose from a
+/// status: GitHub rejects a request with no `user-agent` outright, and an
+/// origin that rate-limits or blocks by agent cannot tell zurl from a scraper.
+///
+/// The version here is a SEPARATE literal from `build.zig.zon`'s, and nothing
+/// makes them agree — a bump will drift silently, with no compiler error. That
+/// is tolerable at 0.0.0 and stops being tolerable the moment the version
+/// means something; the fix then is a build option, not a sharper comment.
+pub const default_user_agent = "zurl/0.0.0";
+
 pub const Request = struct {
     method: std.http.Method = .GET,
     /// origin-form target: path plus optional query, e.g. "/metrics".
@@ -23,6 +35,10 @@ pub const Request = struct {
     /// benchmark repo sets; anything else goes in `extra`.
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    /// Sent as `user-agent`. Null sends none, which is what a caller supplying
+    /// its own through `extra` wants — nothing here deduplicates, so leaving
+    /// both set sends the header twice.
+    user_agent: ?[]const u8 = default_user_agent,
     extra: []const Header = &.{},
     /// Body bytes, sent with an automatic Content-Length. No request-side
     /// chunked encoding in v0 (nothing in either repo needs it).
@@ -249,6 +265,9 @@ fn validate(req: Request) RequestError!void {
     if (req.content_type) |ct| for (ct) |b| {
         if (!isFieldValueByte(b)) return error.InvalidRequestHeader;
     };
+    if (req.user_agent) |ua| for (ua) |b| {
+        if (!isFieldValueByte(b)) return error.InvalidRequestHeader;
+    };
 
     for (req.extra) |h| {
         if (h.name.len == 0) return error.InvalidRequestHeader;
@@ -269,6 +288,7 @@ pub fn writeRequest(out: *Io.Writer, req: Request) (Io.Writer.Error || RequestEr
     try out.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\n", .{
         @tagName(req.method), req.target, req.host,
     });
+    if (req.user_agent) |ua| try out.print("user-agent: {s}\r\n", .{ua});
     if (req.authorization) |a| try out.print("authorization: {s}\r\n", .{a});
     if (req.content_type) |ct| try out.print("content-type: {s}\r\n", .{ct});
     if (req.body) |b| try out.print("content-length: {d}\r\n", .{b.len});
@@ -384,4 +404,31 @@ test "the bytes a valid request is allowed to carry" {
     });
     try t.expect(std.mem.startsWith(u8, out.buffered(), "GET /p%20ath?q=1&r=%C3%A9 HTTP/1.1\r\n"));
     try t.expect(std.mem.indexOf(u8, out.buffered(), "x-note: caf\xc3\xa9\r\n") != null);
+}
+
+test "a user-agent is sent by default, suppressible, and validated like any value" {
+    // Sent because its absence is a failure a caller cannot see in a status:
+    // some APIs reject a UA-less request outright, so "no header" becomes a
+    // 403 with nothing in it to explain why.
+    var buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try writeRequest(&out, .{ .host = "example.com" });
+    try t.expect(std.mem.indexOf(u8, out.buffered(), "user-agent: " ++ default_user_agent ++ "\r\n") != null);
+
+    // Null suppresses it, which is what a caller sending its own through
+    // `extra` needs — nothing here deduplicates.
+    var buf2: [512]u8 = undefined;
+    var out2: Io.Writer = .fixed(&buf2);
+    try writeRequest(&out2, .{ .host = "example.com", .user_agent = null });
+    try t.expect(std.mem.indexOf(u8, out2.buffered(), "user-agent") == null);
+
+    // And it is a field value like any other: no free pass for a default that
+    // a caller can override with something the wire cannot carry.
+    var buf3: [512]u8 = undefined;
+    var out3: Io.Writer = .fixed(&buf3);
+    try t.expectError(error.InvalidRequestHeader, writeRequest(&out3, .{
+        .host = "example.com",
+        .user_agent = "evil\r\nX-Injected: 1",
+    }));
+    try t.expectEqual(@as(usize, 0), out3.end);
 }

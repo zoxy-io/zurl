@@ -170,7 +170,11 @@ Three things are structural, never flags:
 
 ### A default `user-agent`
 
-zurl sends `host`, and optionally `authorization`, `content-type`,
+**Landed.** `zurl/0.0.0` unless the caller sets `user_agent`, and null sends
+none for a caller supplying its own through `extra`. Validated as a field
+value like everything else, so an overridden one cannot inject.
+
+zurl sent `host`, and optionally `authorization`, `content-type`,
 `content-length`, `connection` — and nothing else. No `user-agent` at all.
 Several APIs require one (GitHub rejects UA-less requests outright), so its
 absence is a request that fails for a reason the caller cannot see in the

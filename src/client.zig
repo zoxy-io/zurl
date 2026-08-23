@@ -24,6 +24,12 @@ pub const FetchRequest = struct {
     method: std.http.Method = .GET,
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    /// Sent as `user-agent`. Null sends none.
+    ///
+    /// Defaulted because its ABSENCE is a failure a caller cannot diagnose
+    /// from a status -- GitHub rejects a UA-less request outright. Set your
+    /// own to identify your service; nothing deduplicates against `extra`.
+    user_agent: ?[]const u8 = connection.default_user_agent,
     extra: []const connection.Header = &.{},
     body: ?[]const u8 = null,
     sink: connection.Sink = .discard,
@@ -540,6 +546,7 @@ const Task = struct {
             .host = host,
             .authorization = hop.authorization,
             .content_type = task.req.content_type,
+            .user_agent = task.req.user_agent,
             .extra = task.req.extra,
             .body = hop.body,
             // One request per fetch: close is what gives a reply with no
