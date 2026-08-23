@@ -64,6 +64,35 @@ The test that enforces it: parse the same canned responses at **every**
 two-segment split position and byte-at-a-time, and require the identical
 event sequence every time.
 
+`zig build fuzz` makes that an oracle rather than a test case, over a seed
+corpus plus 20 k deterministic mutations, in 0.15 s. "It did not crash" would
+have been the wrong property — the incident this library exists for never
+crashed. So the oracle compares every channel a caller can observe:
+
+* the verdict, **and the bytes handed to the sink, on failure as well as
+  success** — `streamExact64` delivers what it read before hitting EOF, so two
+  segmentations can both return `UnexpectedEof` having written different bytes
+  first, and `UnexpectedEof` is the largest single bucket in the search;
+* the header and trailer callback sequence, whose slices point into the
+  reader's buffer — the one piece of memory a whole-buffer fill and a
+  byte-at-a-time fill lay out differently;
+* the offset the parse left the stream at. Two parses can agree on every body
+  byte and still frame the connection differently, which only surfaces on the
+  *next* response — that is ziglang/zig#25181's shape.
+
+It has earned its keep twice. The first run with the header channel enabled
+found the trailer section accepting a field the head refuses (`0\r\n: v\r\n\r\n`)
+— the same bytes meaning two different things depending on where in the message
+they appeared. The hparse adoption then tripped it immediately: a budget check
+against `r.buffered().len`, which also holds body bytes, made a response that
+fit when segmented fail when it arrived whole.
+
+Zig 0.16.0's coverage-guided `--fuzz` does not build (a toolchain bug in its own
+bundled `test_runner.zig:566`), so the mutator is in-tree, seeded and
+deterministic — a failure replays from the iteration number printed beside it.
+A new framing shape gets a seed, because the mutator can only reach what the
+seeds spell.
+
 ## 5. Transport is injected, never owned
 
 `suite.probeOnce` speaks over zrk's TLS specifically, so that a handshake the
@@ -74,6 +103,19 @@ A `Connection` is a `*Io.Reader` + `*Io.Writer` pair, full stop. Plain TCP,
 std TLS, zrk's ztls, an in-memory pipe in a test — all the same type. `fetch`
 is the convenience layer that dials for you; `Connection` is the layer that
 does not care.
+
+TLS is the rule's own test case, and it passed: `src/tls.zig` is an adapter
+that turns one reader/writer pair into another, `Connection` was not touched to
+make https work, and a consumer who prefers zrk's ztls hands `Connection` its
+own two pointers and never compiles the file.
+
+Verified live rather than asserted, by `zig build tls-smoke`: example.com
+matches `curl` byte for byte (200, 559 bytes), google.com moves 89 KB of chunked
+body through it, and expired / wrong-host / self-signed / untrusted-root all
+come back `TlsCertificateInvalid` with std's precise reason available through
+`tls.Diagnostics`. It is a separate build step because std ships no TLS server,
+so a real handshake needs a real origin — and a unit test that fails when DNS is
+down is a gate people learn to ignore.
 
 ## 6. A leaf package: no runtime, no TLS stack, no third copy of anything
 
@@ -119,10 +161,55 @@ cAdvisor samples because a poll period depended on scrape cost. The change was
 correct; the *cost* was invisible until measured.
 
 So `bench/` is part of the deliverable: parser microbenchmarks and an
-end-to-end loopback comparison against std.http.Client, run in ReleaseFast,
-numbers in the README. The standing rule from the parity discussion: zrk
-adopts nothing from here until these benchmarks say parity — and the inner
-loop of a load generator may simply never be the right consumer.
+end-to-end loopback comparison against std.http.Client, run in ReleaseFast.
+The headline table is in the README; the method is here. The standing rule from
+the parity discussion: zrk adopts nothing from here until these benchmarks say
+parity — and the inner loop of a load generator may simply never be the right
+consumer.
+
+### How to measure so the number means something
+
+**Bands, not numbers, and always against a baseline re-run in the same session
+on the same box.** A figure from yesterday's README is not a control. Interleave
+A/B pairs rather than running all of A then all of B, so drift shows up in both
+arms instead of only the second.
+
+**State the power state alongside any number taken on a laptop.** The same box
+and the same commit measure 1.7× slower across every row on battery
+(`powersave`, 1.2 GHz) than on AC (4.3 GHz boost). Half a session was spent
+chasing a regression that was a CPU governor.
+
+**Say when a band is too wide to conclude from.** The `concurrent` slice
+measured fresh-conn at 11.3–16.8k req/s against a 11.7–16.8k baseline, which
+resolves nothing — and keep-alive, a path that change could not touch, swung
+75–95k across the same six runs. That spread *is* the noise floor, and the
+honest report is "no signal above it", not "no regression".
+
+### What assertions cost
+
+Assertions (docs/TIGER_STYLE.md) are `std.debug.assert`, so they are absent from
+any ReleaseFast table *by construction* — the compiler removes them, and an
+unchanged benchmark proves nothing about them either way.
+
+Measured where they do run — ReleaseSafe, four interleaved A/B pairs against the
+same code without them, **before the hparse adoption and not re-run since**:
+small-cl 129–132 → 133–137 ns, zrk-1k 68–70 → 70–74 ns, cadvisor unmoved at
+0.19–0.20 ms. Three to five percent on the head-heavy shapes and nothing on the
+body-heavy one, which spends its time in `streamExact64` and `LineSink.feed`
+rather than in the head.
+
+### The rule has caught three things, unprompted
+
+* The first `fetch` waited on its deadline by polling a flag every 20 ms — a
+  166× latency floor, 50 req/s, that all 16 correctness tests passed over
+  without blinking. `bench/e2e.zig` convicted it on its first run.
+* Adopting hparse was justified by numbers and *rejected* by them first: the
+  scanner is faster, but its one-shot API made segmented head parsing
+  quadratic. Only the resume cursor changed the answer.
+* Extracting a function to satisfy the 70-line limit cost 5× on small-cl and 10×
+  on zrk-1k, because a 4 KiB array defaulted inside a `= .{}` struct literal
+  makes the compiler materialise an initialiser on every parse. Caught in the
+  same sitting as the refactor rather than in a profile months later.
 
 ## Non-goals (v0)
 

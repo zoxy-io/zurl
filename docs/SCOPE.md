@@ -40,11 +40,59 @@ that is a defect report against the library, not a shortcut to take.
 
 ## Tier 1 — required before the harness swap is safe
 
-**In this order.** It is risk order, not convenience order, and it is settled:
-an item is not promoted because it happens to be small. `content-encoding` in
-particular is a live silent-corruption path and a few lines to close, which is
-an argument for doing it *well*, not for doing it *first* — the header gap
-above it is what makes the other three verifiable at all.
+**In this order**, and it is risk order rather than convenience order. An item
+does not get promoted for being small: `content-encoding` is a live
+silent-corruption path and only a few lines to close, which is an argument for
+doing it *well*, not for doing it *first*.
+
+The refusal item leads because it was **appended after this order was first
+written**, so it had never actually been placed — and it is the only entry here
+that is broken in `main` rather than merely missing. Risk order puts a live
+header-injection hole ahead of four features. Nothing else moved.
+
+### Refuse a target or host that cannot appear in a request line
+
+A security item, and the one thing on this list that is broken in `main` today
+rather than merely missing.
+
+`writeRequest` composes the request line by interpolation:
+
+```zig
+try out.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\n", .{ method, target, host });
+```
+
+Nothing validates `target` or `host` — there are two assertions that they are
+non-empty, and assertions are gone in the ReleaseFast build a consumer is free
+to choose. A target containing CR or LF therefore writes attacker-chosen bytes
+into the request line, which is header injection: everything after the CRLF is
+parsed by the origin as another header, or another request.
+
+**It is reachable through `fetch`, not only through `Connection`.** `fetch`
+runs the URL through `std.Uri.parse` first, which looks like validation and is
+not: `parse` accepts CR and LF in a path and hands them back verbatim in
+`Component.percent_encoded`, which `fetch` writes straight into the target.
+Measured, Zig 0.16.0:
+
+| input | `std.Uri.parse` | resulting path |
+|---|---|---|
+| `http://h/a b` | accepted | `/a b` — space, breaks the request line |
+| `http://h/a\r\nX-Injected: 1` | accepted | injects a header |
+| `http://h/a\nX: 1` | accepted | injects a header |
+
+So a consumer that forwards a URL it was handed — which is exactly what a leaf
+library invites — lets whoever chose that URL add headers to zurl's request.
+It is the same reasoning `client.zig` already applies to a bad URL being an
+error rather than an assertion: *a leaf library that panics on a bad URL panics
+its consumer*, and one that injects headers on a bad URL compromises its
+consumer.
+
+The fix is refusal, not encoding: zurl cannot re-encode a target without
+guessing whether a `?` the caller wrote is a query separator or a literal.
+Rejecting CR, LF, space and control characters in the target and host is
+unambiguous, cheap, and turns a silent request rewrite into an error.
+
+**`std.http.Client` has the same hole**, so this is not a regression the swap
+introduces — see docs/RESEARCH.md.
 
 ### Response headers must be reachable from `fetch`
 
@@ -106,50 +154,6 @@ Several APIs require one (GitHub rejects UA-less requests outright), so its
 absence is a request that fails for a reason the caller cannot see in the
 status.
 
-### Refuse a target or host that cannot appear in a request line
-
-A security item, and the one thing on this list that is broken in `main` today
-rather than merely missing.
-
-`writeRequest` composes the request line by interpolation:
-
-```zig
-try out.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\n", .{ method, target, host });
-```
-
-Nothing validates `target` or `host` — there are two assertions that they are
-non-empty, and assertions are gone in the ReleaseFast build a consumer is free
-to choose. A target containing CR or LF therefore writes attacker-chosen bytes
-into the request line, which is header injection: everything after the CRLF is
-parsed by the origin as another header, or another request.
-
-**It is reachable through `fetch`, not only through `Connection`.** `fetch`
-runs the URL through `std.Uri.parse` first, which looks like validation and is
-not: `parse` accepts CR and LF in a path and hands them back verbatim in
-`Component.percent_encoded`, which `fetch` writes straight into the target.
-Measured, Zig 0.16.0:
-
-| input | `std.Uri.parse` | resulting path |
-|---|---|---|
-| `http://h/a b` | accepted | `/a b` — space, breaks the request line |
-| `http://h/a\r\nX-Injected: 1` | accepted | injects a header |
-| `http://h/a\nX: 1` | accepted | injects a header |
-
-So a consumer that forwards a URL it was handed — which is exactly what a leaf
-library invites — lets whoever chose that URL add headers to zurl's request.
-It is the same reasoning `client.zig` already applies to a bad URL being an
-error rather than an assertion: *a leaf library that panics on a bad URL panics
-its consumer*, and one that injects headers on a bad URL compromises its
-consumer.
-
-The fix is refusal, not encoding: zurl cannot re-encode a target without
-guessing whether a `?` the caller wrote is a query separator or a literal.
-Rejecting CR, LF, space and control characters in the target and host is
-unambiguous, cheap, and turns a silent request rewrite into an error.
-
-**`std.http.Client` has the same hole**, so this is not a regression the swap
-introduces — see docs/RESEARCH.md.
-
 ## Tier 2 — for remote API work generally
 
 * **Streaming request bodies.** `body` is `?[]const u8`, so `ycs.put` holds a
@@ -191,6 +195,16 @@ It loses anyway, because retry needs something the library cannot know: whether
 replaying this request is safe. A silent second POST is worse than any
 duplication it would save. `fetch` means *one bounded request*, and a caller
 that wants three writes three.
+
+## Also outstanding, outside the tiers
+
+* **Point the harness's control plane at zurl and delete its std wrapper.**
+  Blocked on Tier 1 — chiefly redirects, because `std.http.Client` follows them
+  silently today and a client that does not would turn a followed 302 into a
+  reported benchmark failure.
+* **Run `bench-e2e` on the zio backend.** Every number recorded so far is
+  `Io.Threaded`, and rule 6's "both backends are first class" is untested at the
+  wire until that happens.
 
 ## Non-goals
 

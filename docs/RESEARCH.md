@@ -38,6 +38,18 @@ The incumbent, and what `bench/src/http.zig` v2 wraps today.
   forever on larger HTTPS payloads unless `write_buffer_size` is raised.
 * Ships TLS + certificate verification, redirects, a connection pool — the
   batteries a control plane wants and a parser bench does not.
+* **Measured against zurl end to end**, loopback, same server, same `Io`, 1 KiB
+  body, three runs:
+
+  | discipline | zurl | std.http.Client | |
+  |---|---|---|---|
+  | keep-alive, one connection | 91–101 k req/s | 88–107 k req/s | **parity** (syscall-bound) |
+  | fresh connection per request | 15.5–20.8 k req/s | 9.2–11.2 k req/s | **~1.8×** |
+
+  Parity on keep-alive is the honest headline: both are syscall-bound there, and
+  48 ns of parse inside a ~10 µs round trip is 0.5%. The fresh-connection gap is
+  where zurl's lack of pooling machinery shows up as an advantage rather than a
+  gap. Any pitch to zrk rests on API and correctness, not speed.
 * **A URL can inject request headers.** Found while scoping zurl's own
   equivalent hole, and worth reporting upstream. `std.Uri.parse` accepts CR and
   LF inside a path and records the span as `Component.percent_encoded`;

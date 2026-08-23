@@ -1,158 +1,149 @@
 # zurl
 
-An **experimental** std.Io-native HTTP/1.1 client for Zig, grown out of the
-zoxy benchmark harness — where three separate HTTP implementations at three
-levels of completeness produced, between them: a segfault only in the
-ReleaseFast musl build, a 71-minute unbounded hang, a deliberate
-leak-on-timeout, a 204 that hung forever, and a chunked body read as plain
-text for months.
+An **experimental** `std.Io`-native HTTP/1.1 client for Zig 0.16 — zero
+allocation, one dependency, and a whole-request deadline that actually fires.
 
-Every one of those is a design rule here. **Start with
-[docs/DESIGN.md](docs/DESIGN.md)** (the eight rules, each traceable to an
-incident), then [docs/SCOPE.md](docs/SCOPE.md) (which client features are in,
-which are the caller's, and which are refused) and
-[docs/RESEARCH.md](docs/RESEARCH.md) (what exists in the ecosystem and why none
-of it fits). How it is written and how a change
-lands: [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) and [CLAUDE.md](CLAUDE.md).
+It grew out of the zoxy benchmark harness, where three separate HTTP
+implementations produced, between them: a segfault only in the ReleaseFast musl
+build, a 71-minute unbounded hang, a deliberate leak-on-timeout, a 204 that hung
+forever, and a chunked body read as plain text for months. Every one of those is
+a design rule here — [docs/DESIGN.md](docs/DESIGN.md) has the eight of them.
 
-Private while it is an experiment. Zig 0.16.0; one dependency,
-[zoxy-io/hparse](https://github.com/zoxy-io/hparse), which supplies the head
-scanner (rule 6 says what a pin has to clear).
+> Private while it is an experiment. The API moves.
 
-## Shape
+## Requirements
 
-```
-parser      head + framed body → sink; zero-allocation; owns ALL framing
-            (content-length / chunked+trailers / close-delimited, bodyless
-            statuses, TE-beats-CL, conflicting CL refused); fuzzed against
-            segmentation invariance
-Connection  request/response over an injected *Io.Reader + *Io.Writer —
-            plain TCP, std TLS, zrk's ztls, or a fixed buffer in a test
-fetch       URL in, deadline-bounded Response out; the deadline is a race
-            (worker vs sleeper through an Io.Queue), never a poll
-Sink        discard | collect | lines (LineSink) | stream — no "none"
-tls         std.crypto.tls as a TRANSPORT: in a *Io.Reader + *Io.Writer,
-            out a *Io.Reader + *Io.Writer. Trust anchors are the caller's,
-            because loading them allocates and zurl does not
+Zig **0.16.0** exactly — `std.Io` moves, so 0.15 and master are both wrong.
+
+One dependency, [zoxy-io/hparse](https://github.com/zoxy-io/hparse), for the
+head scan. It is std-only and does no I/O, so zurl stays a leaf package: it
+brings no runtime and no TLS stack that could collide with one you already pin.
+
+```sh
+zig fetch --save git+https://github.com/zoxy-io/zurl
 ```
 
-Works identically on `Io.Threaded` and zio, because both are production
-backends for its consumers. https works through the same seam: `fetch` takes a
-`tls` config carrying caller-owned trust anchors, splices a
-`std.crypto.tls.Client` into the transport, and `Connection` cannot tell the
-difference. There is no default trust store on purpose — building one
-allocates, and a caller who silently got "verify nothing" would have an https
-URL that looks secure and is not.
+```zig
+const zurl = b.dependency("zurl", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("zurl", zurl.module("zurl"));
+```
+
+## Use
+
+Every request is bounded. `fetch` returns `null` when the deadline elapsed —
+that is not an error case you may forget to handle, it is the return type.
+
+```zig
+var body: std.Io.Writer.Allocating = .init(gpa);
+defer body.deinit();
+
+const res = try zurl.fetch(io, .{
+    .url = "http://127.0.0.1:8080/metrics",
+    .sink = .{ .collect = &body },
+    .deadline_ns = 5 * std.time.ns_per_s,
+    .what = "metrics",           // named in the timeout message, never a URL
+}) orelse return error.TimedOut;
+
+if (!res.ok()) return error.BadStatus;
+std.debug.print("{d} bytes\n", .{body.written().len});
+```
+
+**Bodies go to a sink; there is no way to forget one.** Pick how you want it:
+
+```zig
+.sink = .discard,                 // HEAD, DELETE, a webhook's 204
+.sink = .{ .collect = &body },    // keep the whole thing
+.sink = .{ .lines = &line_sink }, // parse a line at a time, keep none of it
+.sink = .{ .stream = writer },    // any other Io.Writer
+```
+
+`lines` is what lets a 1.5 MiB Prometheus exposition be parsed without ever
+holding more than one line. Lines too long for `carry` are dropped whole and
+counted, never truncated — a truncated metric line still parses, and reports a
+wrong number.
+
+```zig
+var buf: [64 * 1024]u8 = undefined;
+var carry: [8 * 1024]u8 = undefined;
+var sink = zurl.LineSink.init(&buf, &carry, &ctx, onLine);
+```
+
+### https
+
+Trust anchors are **yours**. There is no default, on purpose: loading a store
+allocates and zurl does not, and a caller who silently got "verify nothing"
+would hold an https URL that looks secure and is not. An https URL with no
+`tls` config is `error.TlsNotConfigured`, refused before anything is dialled.
+
+```zig
+var certificates: std.crypto.Certificate.Bundle = .empty;
+defer certificates.deinit(gpa);
+try certificates.rescan(gpa, io, .now(io, .real));   // once, at startup
+var lock: std.Io.RwLock = .init;
+
+const res = try zurl.fetch(io, .{
+    .url = "https://api.example.com/v1/things",
+    .authorization = "Bearer …",
+    .sink = .{ .collect = &body },
+    .tls = .{ .ca = .{ .bundle = .{
+        .gpa = gpa, .lock = &lock, .certificates = &certificates,
+    } } },
+}) orelse return error.TimedOut;
+```
+
+### Many requests, one connection
+
+`fetch` dials, sends `connection: close`, and hangs up — right for a poll or a
+one-shot, wasteful for a dozen calls to one origin. `Connection` is the layer
+underneath: a `*Io.Reader` and a `*Io.Writer`, and it does not care where they
+came from — plain TCP, std TLS, zrk's ztls, or two fixed buffers in a test.
+
+```zig
+var conn = zurl.Connection.init(transport.reader(), transport.writer());
+const res = try conn.roundTrip(.{ .host = "example.com", .target = "/" }, sink, .{});
+```
+
+## What it does
+
+Framing is the library's job, always: content-length, chunked (with trailers),
+close-delimited, bodyless statuses, `Transfer-Encoding` beating
+`Content-Length`, conflicting `Content-Length` refused. You never see an
+undecoded byte and never choose whether a 204 has a body.
+
+Works identically on `Io.Threaded` and zio — both are production backends for
+its consumers, so a mechanism that only works on one is not a mechanism zurl
+uses.
+
+**Not yet:** response headers are not reachable from `fetch`, redirects are not
+followed, and no `user-agent` is sent. [docs/SCOPE.md](docs/SCOPE.md) is the
+list, in the order it will be built, and says what is deliberately refused
+(HTTP/2, cookies, connection pools, signing schemes).
 
 ## Numbers
 
-ReleaseFast, 8-core x86_64_v3 Linux box, 2026-08-23. Reproduce with
+ReleaseFast, 8-core x86_64_v3 Linux, 2026-08-23. Reproduce with
 `zig build bench-parse -Doptimize=ReleaseFast` and `bench-e2e`.
-
-State the power state alongside any number taken on a laptop: the same box
-and the same commit measure 1.7x slower across every row on battery
-(`powersave`, 1.2 GHz) than on AC (4.3 GHz boost). That is why the rule is
-bands compared inside one session against a baseline re-run in that session,
-never a number carried over from another day.
-
-**Parser microbench** (`Reader.fixed`, transport removed):
 
 | shape | ns/resp | throughput |
 |---|---|---|
 | small-cl (8 headers, 128 B body) | 121 | 8.3 M resp/s |
 | zrk-1k (proxy-bench shape, 1 KiB body) | **48** | 20.8 M resp/s, 22.9 GB/s |
-| cadvisor (1.5 MiB chunked → LineSink) | 0.19 ms/scrape | 8.0 GB/s, 14.7 k lines |
+| cadvisor (1.5 MiB chunked → `LineSink`) | 0.19 ms/scrape | 8.0 GB/s, 14.7 k lines |
 
-The head scan is `zoxy-io/hparse` as of the adoption commit. A/B on one box in
-one session, three interleaved pairs against the hand-rolled scanner it
-replaced: **zrk-1k 62 → 48 ns**, bands 18.1–18.2 → 22.8–22.9 GB/s and nowhere
-near touching; small-cl a wash at 121–122 ns; cadvisor unmoved. That split is
-what docs/RESEARCH.md's fitted model predicted — hparse wins on fixed cost and
-loses slightly on per-header slope, so the crossover sits around ten headers
-and small-cl has eight. The much larger win is not in this table at all: it is
-the segmented case, where the old scanner was linear and the *one-shot* hparse
-API was quadratic, and `parseResponseResume` is what made adoption possible.
+End-to-end against `std.http.Client` on loopback: parity keep-alive
+(syscall-bound), ~1.8× on a fresh connection per request. The parser is not the
+story at the wire — 48 ns inside a ~10 µs round trip is 0.5%.
 
-Assertions (docs/TIGER_STYLE.md) are `std.debug.assert`, so they are absent
-from the table above *by construction* — ReleaseFast compiles them out.
-Measured where they do run — ReleaseSafe, four A/B pairs interleaved against
-the same code without them, **before the hparse adoption and not re-run
-since**: small-cl 129–132 → 133–137 ns, zrk-1k 68–70 →
-70–74 ns, cadvisor unmoved at 0.19–0.20 ms. Three to five percent on the
-head-heavy shapes and nothing on the body-heavy one, which spends its time in
-`streamExact64` and `LineSink.feed` rather than in the head.
+Methodology, the A/B bands behind those figures, and what assertions cost live
+with [rule 8](docs/DESIGN.md); the comparison against std is in
+[docs/RESEARCH.md](docs/RESEARCH.md).
 
-**End-to-end loopback** vs `std.http.Client`, same server, same Io, 1 KiB
-body, three runs:
+## Docs
 
-| discipline | zurl | std.http.Client | |
-|---|---|---|---|
-| keep-alive, one connection | 91–101 k req/s | 88–107 k req/s | **parity** (syscall-bound) |
-| fresh connection per request | 15.5–20.8 k req/s | 9.2–11.2 k req/s | **~1.8×** |
-
-Two conclusions worth stating plainly:
-
-* **The parser is not the story at the wire.** 48 ns of parse inside a ~10 µs
-  loopback round trip is 0.5%, and it was 0.6% before hparse — a 23% faster
-  head scan moved the round trip by a tenth of a percent. Any pitch to zrk
-  rests on API and correctness, not speed — and per the standing rule, zrk
-  adopts nothing without running these numbers itself in its own harness.
-* **The benchmark caught a real API defect on its first run.** The first
-  `fetch` waited on its deadline by polling a flag every 20 ms — a 166×
-  latency floor (50 req/s) that all 16 correctness tests passed over without
-  blinking. It is now a queue race and fetch does 18 k req/s. Design rule 8
-  earned its place on day one.
-
-## Status / next
-
-- [x] parser + framing property tests (segmentation invariance at every split)
-- [x] Connection over injected transports, keep-alive bookkeeping
-- [x] deadline-bounded fetch (DNS via `HostName.connect`, plain HTTP)
-- [x] parse + e2e benchmarks
-- [x] TLS transport adapter over `std.crypto.tls` — `src/tls.zig`, one
-      adapter and no branch anywhere above it. Verified live by
-      `zig build tls-smoke`, which is a separate step because std ships no TLS
-      server and a unit test that needs DNS is a gate people learn to ignore:
-      example.com matches `curl` byte for byte (200, 559 bytes), google.com
-      moves 89 KB of chunked body through it, and expired / wrong-host /
-      self-signed / untrusted-root all come back `TlsCertificateInvalid` with
-      std's precise reason available through `tls.Diagnostics`.
-- [ ] **Tier 1** ([docs/SCOPE.md](docs/SCOPE.md)) — what the control-plane swap
-      needs before it is safe, in the order the risk sits:
-  - [ ] response headers reachable from `fetch`. `Response` is
-        `{status, body_len}` and `on_header` was never passed through, so
-        `Retry-After` is unreachable and `discord.post` *guesses* its 429
-        backoff today
-  - [ ] `content-encoding`: decode or refuse, never pass through. A server that
-        gzips unasked currently hands compressed bytes to `LineSink`, which
-        parses them as text — the cAdvisor incident, rebuilt
-  - [ ] redirects, `max_redirects = 0` by default, with cross-origin
-        `authorization` stripped structurally (the harness carries a live IAM
-        bearer token)
-  - [ ] a default `user-agent` — zurl sends none, and some APIs reject that
-  - [ ] **refuse a target or host that cannot appear in a request line.** The
-        only item here that is broken in `main` rather than missing: nothing
-        validates them, and `std.Uri.parse` accepts CR/LF in a path and returns
-        it verbatim, so a URL can inject headers into zurl's request.
-        `std.http.Client` has the same hole (docs/RESEARCH.md)
-- [ ] point the zoxy benchmark's control plane at zurl and delete its std
-      wrapper. Blocked on Tier 1: `std.http.Client` follows redirects silently
-      today, so swapping in a client that does not would turn a followed 302
-      into a reported benchmark failure
-- [ ] zio-backend run of bench-e2e (numbers above are `Io.Threaded`)
-- [x] fuzz the parser — `zig build fuzz`, with design rule 4 as the oracle.
-      The same bytes parsed whole, at a split, and one byte per read must give
-      one answer on every channel a caller can observe: the verdict and body
-      bytes, the header/trailer callback sequence (whose slices live in the
-      reader's buffer — the memory segmentation actually changes), and the
-      offset the parse left the stream at, because two parses can agree on
-      every body byte and still frame the connection differently. Every seed
-      shape at every split position plus 20 k mutations run per slice, in
-      0.15 s. It earned its keep immediately: the first run with the header
-      channel enabled found the trailer section accepting a field the head
-      refuses (`0\r\n: v\r\n\r\n`) — the same bytes meaning two different
-      things depending on where in the message they appeared. Fixed, with the
-      shape now a seed; 3 M further mutations across six seeds found nothing.
-      Zig 0.16.0's coverage-guided `--fuzz` does not build (a toolchain bug in
-      its own bundled `test_runner.zig:566`), so the mutator is in-tree and
-      seeded.
+| | |
+|---|---|
+| [docs/DESIGN.md](docs/DESIGN.md) | the eight rules, each traceable to an incident — *what must be true* |
+| [docs/SCOPE.md](docs/SCOPE.md) | what is in, what is the caller's, what is refused, and what is next |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | what exists in the ecosystem and why none of it fits |
+| [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) | how it is written |
+| [CLAUDE.md](CLAUDE.md) | how a change lands: slices, and the gates each one passes |
