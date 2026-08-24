@@ -35,6 +35,29 @@ const zurl = b.dependency("zurl", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("zurl", zurl.module("zurl"));
 ```
 
+## Guarantees
+
+Framing is the library's job, always: content-length, chunked (with trailers),
+close-delimited, bodyless statuses, `Transfer-Encoding` beating
+`Content-Length`, conflicting `Content-Length` refused. You never see an
+undecoded byte and never choose whether a 204 has a body.
+
+That extends to content codings. zurl decodes none, so a body arriving as
+`gzip` is `error.UnsupportedContentEncoding` rather than compressed bytes
+handed to a sink expecting text. Nothing here sends `accept-encoding`, so a
+compliant origin never triggers it; pass `allow_encoded_body` if the raw bytes
+are what you actually want.
+
+Works identically on `Io.Threaded` and zio — both are production backends for
+its consumers, so a mechanism that only works on one is not a mechanism zurl
+uses.
+
+Requests carry `user-agent: zurl/0.0.0` unless you set `user_agent` yourself
+(or null it, if you send your own).
+
+[docs/SCOPE.md](docs/SCOPE.md) lists what is next and what is deliberately
+refused (HTTP/2, cookies, connection pools, signing schemes).
+
 ## Use
 
 Every request is bounded. `fetch` returns `null` when the deadline elapsed —
@@ -178,29 +201,6 @@ came from — plain TCP, std TLS, zrk's ztls, or two fixed buffers in a test.
 var conn = zurl.Connection.init(transport.reader(), transport.writer());
 const res = try conn.roundTrip(.{ .host = "example.com", .target = "/" }, sink, .{});
 ```
-
-## What it does
-
-Framing is the library's job, always: content-length, chunked (with trailers),
-close-delimited, bodyless statuses, `Transfer-Encoding` beating
-`Content-Length`, conflicting `Content-Length` refused. You never see an
-undecoded byte and never choose whether a 204 has a body.
-
-That extends to content codings. zurl decodes none, so a body arriving as
-`gzip` is `error.UnsupportedContentEncoding` rather than compressed bytes
-handed to a sink expecting text. Nothing here sends `accept-encoding`, so a
-compliant origin never triggers it; pass `allow_encoded_body` if the raw bytes
-are what you actually want.
-
-Works identically on `Io.Threaded` and zio — both are production backends for
-its consumers, so a mechanism that only works on one is not a mechanism zurl
-uses.
-
-Requests carry `user-agent: zurl/0.0.0` unless you set `user_agent` yourself
-(or null it, if you send your own).
-
-[docs/SCOPE.md](docs/SCOPE.md) lists what is next and what is deliberately
-refused (HTTP/2, cookies, connection pools, signing schemes).
 
 ## The `zurl` binary
 
