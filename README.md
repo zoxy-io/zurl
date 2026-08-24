@@ -1,13 +1,13 @@
 # zurl
 
+[![CI](https://github.com/zoxy-io/zurl/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zurl/actions/workflows/ci.yml)
+
 An **experimental** `std.Io`-native HTTP/1.1 client for Zig 0.16 — zero
 allocation, one dependency, and a whole-request deadline that actually fires.
 
-It grew out of the zoxy benchmark harness, where three separate HTTP
-implementations produced, between them: a segfault only in the ReleaseFast musl
-build, a 71-minute unbounded hang, a deliberate leak-on-timeout, a 204 that hung
-forever, and a chunked body read as plain text for months. Every one of those is
-a design rule here — [docs/DESIGN.md](docs/DESIGN.md) has the eight of them.
+Every design choice traces back to a real incident — a segfault, an unbounded
+hang, a leak on timeout, a body read as plain text — recorded as a rule in
+[docs/DESIGN.md](docs/DESIGN.md).
 
 > Experimental. The API moves — see [docs/SCOPE.md](docs/SCOPE.md) for what
 > is settled and what is not.
@@ -16,13 +16,15 @@ a design rule here — [docs/DESIGN.md](docs/DESIGN.md) has the eight of them.
 
 Zig **0.16.0** exactly — `std.Io` moves, so 0.15 and master are both wrong.
 
-`direnv allow` brings up a pinned shell with that toolchain and curl (the
-other half of `zig build curl-diff`); `devenv shell` does the same without
-direnv. Neither is required if you already have 0.16.0 on `PATH`.
-
 One dependency, [zoxy-io/hparse](https://github.com/zoxy-io/hparse), for the
 head scan. It is std-only and does no I/O, so zurl stays a leaf package: it
 brings no runtime and no TLS stack that could collide with one you already pin.
+
+## Install
+
+`direnv allow` brings up a pinned shell with the toolchain and curl (the
+other half of `zig build curl-diff`); `devenv shell` does the same without
+direnv. Neither is required if you already have 0.16.0 on `PATH`.
 
 ```sh
 zig fetch --save git+https://github.com/zoxy-io/zurl
@@ -211,38 +213,20 @@ zig build -Doptimize=ReleaseFast
 
 It exists to be one half of a **differential oracle**. `zig build curl-diff`
 sends the same request through curl and through it and requires the same body
-bytes, status and exit code — rule 4's discipline one level up. It found four
-real defects on its first two runs, which is the argument for having it.
+bytes, status and exit code — rule 4's discipline one level up.
 
 Flags: `-X -H -d -o -i -D -L -u -A --max-time -k --cacert -I -f -s` and a `-w`
 subset. Not `--compressed`: zurl decodes no content codings, so asking an
 origin to gzip would produce a body it must refuse — and unknown flags are a
 usage error rather than a silent difference.
 
-## Numbers
+## Performance
 
-ReleaseFast, 8-core x86_64_v3 Linux, 2026-08-23. Reproduce with
-`zig build bench-parse -Doptimize=ReleaseFast` and `bench-e2e`.
-
-| shape | ns/resp | throughput |
-|---|---|---|
-| small-cl (8 headers, 128 B body) | 121 | 8.3 M resp/s |
-| zrk-1k (proxy-bench shape, 1 KiB body) | **50** | 20.0 M resp/s, 22.4 GB/s |
-| cadvisor (1.5 MiB chunked → `LineSink`) | 0.19 ms/scrape | 8.0 GB/s, 14.7 k lines |
-
-zrk-1k moved 47–48 → 49–51 ns when the `content-encoding` refusal landed:
-one more header-name comparison per field that matches nothing. Five
-interleaved A/B pairs, bands not overlapping, so it is a real cost and not
-noise — reported rather than absorbed. It buys the guarantee that a sink never
-receives bytes it cannot read, for 3 ns on a ~10 µs round trip.
-
-End-to-end against `std.http.Client` on loopback: parity keep-alive
-(syscall-bound), ~1.8× on a fresh connection per request. The parser is not the
-story at the wire — 50 ns inside a ~10 µs round trip is 0.5%.
-
-Methodology, the A/B bands behind those figures, and what assertions cost live
-with [rule 8](docs/DESIGN.md); the comparison against std is in
-[docs/RESEARCH.md](docs/RESEARCH.md).
+Benchmarked with `zig build bench-parse -Doptimize=ReleaseFast` (parser) and
+`bench-e2e` (wire, against `std.http.Client`). Compare bands from a run on your
+own box, not a number from this file — rule 8 in
+[docs/DESIGN.md](docs/DESIGN.md) explains why, and
+[docs/RESEARCH.md](docs/RESEARCH.md) has the comparison against std.
 
 ## Licence
 
