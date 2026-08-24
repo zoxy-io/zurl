@@ -257,9 +257,12 @@ that wants three writes three.
 ## Also outstanding, outside the tiers
 
 * **Point the harness's control plane at zurl and delete its std wrapper.**
-  Blocked on Tier 1 — chiefly redirects, because `std.http.Client` follows them
-  silently today and a client that does not would turn a followed 302 into a
-  reported benchmark failure.
+  **Done** (benchmark `21b1018`): ~400 lines of std.http.Client wrapper became
+  200 lines of adapter, 325 lines net deleted, and `LineSink` stopped existing
+  twice. Three behaviour changes went with it, all deliberate: redirects are no
+  longer followed (a 3xx arrives as a 3xx), a non-identity `content-encoding`
+  is refused rather than handed to cadvisor's line parser, and requests carry
+  a user-agent. 153/153 tests there.
 * **Run `bench-e2e` on the zio backend.** Every number recorded so far is
   `Io.Threaded`, and rule 6's "both backends are first class" is untested at the
   wire until that happens.
