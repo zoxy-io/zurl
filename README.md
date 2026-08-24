@@ -9,7 +9,8 @@ build, a 71-minute unbounded hang, a deliberate leak-on-timeout, a 204 that hung
 forever, and a chunked body read as plain text for months. Every one of those is
 a design rule here — [docs/DESIGN.md](docs/DESIGN.md) has the eight of them.
 
-> Private while it is an experiment. The API moves.
+> Experimental. The API moves — see [docs/SCOPE.md](docs/SCOPE.md) for what
+> is settled and what is not.
 
 ## Requirements
 
@@ -194,6 +195,25 @@ Requests carry `user-agent: zurl/0.0.0` unless you set `user_agent` yourself
 
 [docs/SCOPE.md](docs/SCOPE.md) lists what is next and what is deliberately
 refused (HTTP/2, cookies, connection pools, signing schemes).
+
+## The `zurl` binary
+
+A curl-shaped front end ships alongside the library:
+
+```sh
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zurl -s -w "%{http_code}" -o page.html https://example.com/
+```
+
+It exists to be one half of a **differential oracle**. `zig build curl-diff`
+sends the same request through curl and through it and requires the same body
+bytes, status and exit code — rule 4's discipline one level up. It found four
+real defects on its first two runs, which is the argument for having it.
+
+Flags: `-X -H -d -o -i -D -L -u -A --max-time -k --cacert -I -f -s` and a `-w`
+subset. Not `--compressed`: zurl decodes no content codings, so asking an
+origin to gzip would produce a body it must refuse — and unknown flags are a
+usage error rather than a silent difference.
 
 ## Numbers
 

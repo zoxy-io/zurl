@@ -89,6 +89,59 @@ pub fn build(b: *std.Build) void {
         hparse_step.dependOn(&run.step);
     }
 
+    // The curl-shaped binary. It allocates, deliberately: docs/SCOPE.md's
+    // scoping principle is that zero allocation binds src/, not an executable,
+    // and this is where the convenience lives so the library does not carry
+    // it. Its real job is the other half of `curl-diff`.
+    const cli = b.addExecutable(.{
+        .name = "zurl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zurl", .module = mod }},
+        }),
+    });
+    b.installArtifact(cli);
+    check_step.dependOn(&cli.step);
+
+    // The argument parser is a pure function of argv, so it tests without a
+    // network and belongs in `zig build test` rather than behind a live gate.
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/args.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zurl", .module = mod }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+    check_step.dependOn(&cli_tests.step);
+
+    const cli_run = b.addRunArtifact(cli);
+    if (b.args) |cli_argv| cli_run.addArgs(cli_argv);
+    b.step("cli", "Run the zurl binary: -- <args>").dependOn(&cli_run.step);
+
+    // The differential oracle: the same request through curl and through the
+    // binary above, and one answer. Rule 4's discipline one level up — the
+    // fuzz oracle says a parse must not depend on how bytes were split, this
+    // says a request must not depend on which client sent it.
+    //
+    // A live gate for the same reason as tls-smoke: it needs a network, a
+    // real origin, and curl on PATH. `-- <url>` aims it elsewhere.
+    const curl_diff = b.addSystemCommand(&.{"sh"});
+    curl_diff.addFileArg(b.path("smoke/curl-diff.sh"));
+    curl_diff.addArtifactArg(cli);
+    if (b.args) |diff_argv| curl_diff.addArgs(diff_argv);
+    // Inherited stdio: the per-case list IS the report, and a gate whose
+    // output only appears when it fails is one nobody reads while it passes.
+    // `has_side_effects` keeps it from being cached away -- it talks to a
+    // network, so yesterday's answer is not this run's.
+    curl_diff.stdio = .inherit;
+    curl_diff.has_side_effects = true;
+    b.step("curl-diff", "Differential run against curl (needs network)")
+        .dependOn(&curl_diff.step);
+
     // The live TLS gate. Deliberately its own step and not part of `test`:
     // std ships no TLS server, so a real handshake needs a real origin, and a
     // unit test that fails when DNS is down is a gate people learn to ignore.

@@ -33,6 +33,7 @@
         // resolving those lazy paths needs them in the package.
         "bench",
         "smoke",
+        "cli",
         "README.md",
     },
 }

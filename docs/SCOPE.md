@@ -279,7 +279,7 @@ that wants three writes three.
 
 ## The binary
 
-A `curl`-mirroring `zurl` executable, in `cli/`, after Tier 1 lands.
+**Landed**, in `cli/`, with the differential oracle it exists for.
 
 Its real justification is not convenience. `zig build tls-smoke` already checks
 zurl against curl byte-for-byte on one URL; a curl-compatible CLI generalises
@@ -287,10 +287,45 @@ that into a **differential oracle** over a corpus — the same discipline as the
 rule 4 fuzz oracle, one level up. Same request, same answer as curl, or one of
 them is wrong.
 
-That also bounds its scope. It implements the flags that make the diff
-meaningful and stops: `-X -H -d -o -i -D -L -u -A --max-time -k --cacert
---compressed -I -f -s`, and a small `-w` subset for status, size and time. Not
-the other two hundred.
+That also bounds its scope. It implements `-X -H -d -o -i -D -L -u -A
+--max-time -k --cacert -I -f -s` and a `-w` subset of `http_code`,
+`size_download` and `size_header`. Not the other two hundred.
 
-Ordering is deliberate: the library gaps first, so the diff has headers,
+**`--compressed` is not among them**, and its absence is this document keeping
+itself honest — it was on the list above until the binary was written. zurl
+decodes no content codings, so asking an origin to gzip would produce a body it
+must then refuse. Accepting the flag and ignoring it would make a differential
+run compare two different requests and call them equal, so unknown flags are a
+usage error instead.
+
+`zig build curl-diff` is the gate. It compares the body byte for byte, the
+status, the exit code, and individual header values — but NOT the head's bytes,
+because zurl reconstructs the head from parsed pairs and has no status line or
+original casing to reproduce. Demanding byte identity there would test the
+reconstruction rather than the client.
+
+It earned its keep on the first run, finding two real defects in the binary:
+`-s` was suppressing the response body, where curl's silent flag only silences
+the progress meter; and `-f` exited before writing its `-w` output, which curl
+writes. A third difference was in the harness rather than the client — stale
+output files compared across cases — and a fourth was real but small: curl does
+not CREATE the output file when `-f` matches, where zurl created an empty one.
+
+Ordering was deliberate: the library gaps first, so the diff had headers,
 redirects and encoding to compare rather than only a status and a body.
+
+### One divergence the oracle cannot close, recorded rather than hidden
+
+`curl -X get` sends `get` verbatim, and a strict origin answers 400. zurl
+cannot reproduce that at all: `connection.Request.method` is
+`std.http.Method`, an enum, so the library has no way to express a method it
+does not know. The CLI refuses a non-canonical method with a usage error.
+
+Upper-casing was tried first and the oracle caught it in one run -- `-X get`
+became a 200 here against curl's 400, which is worse than refusing, because it
+silently sends a DIFFERENT request than the caller typed.
+
+If this ever matters, the fix belongs in the library: `method` would have to
+admit an arbitrary token, and `validate` would then have to check it is one.
+Until then the corpus does not carry a permanently-failing case, because a
+gate that is expected to be red is a gate nobody reads.
