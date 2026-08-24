@@ -1,6 +1,6 @@
 # Why zurl, and what already exists
 
-*Survey date: 2026-08-23. Private experiment; revisit before anything ships.*
+*Survey date: 2026-08-23. Revisit before anything depends on a verdict here.*
 
 ## The problem this repo exists to study
 
