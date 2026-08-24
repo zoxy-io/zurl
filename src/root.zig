@@ -22,6 +22,7 @@ const std = @import("std");
 pub const parser = @import("parser.zig");
 pub const retry = @import("retry.zig");
 pub const url = @import("url.zig");
+pub const auth = @import("auth.zig");
 pub const RetryAfter = retry.RetryAfter;
 pub const Head = parser.Head;
 pub const HeadOptions = parser.HeadOptions;

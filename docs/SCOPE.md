@@ -201,8 +201,15 @@ status.
   part `Connection` deliberately does not do. Buffers are the caller's, as
   everywhere else. It does NOT reconnect on its own: reconnecting means
   resending, which is the question retry asks and gets the same answer.
-* **Refuse a framing header in `extra`.** `validate` checks that every `extra`
-  header name is a token, but not *which* token: a caller can pair
+* **Refuse a framing header in `extra`.** **Landed** as
+  `ReservedRequestHeader`: `content-length`, `transfer-encoding`, `host` and
+  `connection` are refused in `extra`, because zurl decides each of them and a
+  second copy is a disagreement rather than a header. `authorization`,
+  `content-type` and `user-agent` are NOT reserved -- each has a nullable field,
+  and supplying your own through `extra` is documented advice.
+
+  Was: `validate` checked that every `extra` header name is a token, but not
+  *which* token: a caller can pair
   `.extra = &.{.{ .name = "content-length", .value = "0" }}` with a real body
   and put two framing headers on the wire. That is the same disagreement the
   parser already refuses on the RESPONSE side as a smuggling primitive
@@ -213,9 +220,14 @@ status.
   found while reviewing streaming bodies, which widened who would benefit from
   it. Scheduled rather than folded into that slice, because it is a change to
   what `extra` means rather than to how a body is sent.
-* **Basic-auth helper** — base64 into a caller buffer, mostly for the CLI.
-* **Percent-encoding for URL building.** The ergonomic half of the refusal item
-  in Tier 1: refusing a bad target tells a caller it built a wrong URL, and an
+* **Basic-auth helper.** **Landed** as `auth.basic`, base64 into a caller
+  buffer with `basicLen` to size it. A colon in the user id is refused rather
+  than encoded into an ambiguity -- `a:b`/`c` and `a`/`b:c` produce identical
+  bytes, so an origin cannot tell which was meant.
+* **Percent-encoding for URL building.** **Landed** as `url.encode`/
+  `url.encodedLen`, with a `Component` saying which delimiters matter where: a
+  `/` is escaped in a segment and kept in a path, `&` and `=` are escaped in a
+  query. The ergonomic half of the refusal item in Tier 1: refusing a bad target tells a caller it built a wrong URL, and an
   encoder is how it builds a right one. Writes into a caller buffer.
 
   It sits here rather than in Tier 1 only because of *who* builds the URL.
