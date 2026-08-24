@@ -94,7 +94,7 @@ pub const HeadOptions = struct {
     /// refusing it.
     ///
     /// Named to be conspicuous in a diff. zurl decodes no content codings, so
-    /// with this set a `gzip` body reaches the sink as gzip -- which is fine
+    /// with this set a `gzip` body reaches the sink as gzip — which is fine
     /// when the caller is writing it to a file, and is the cAdvisor incident
     /// rebuilt when the caller is a `LineSink` expecting text.
     allow_encoded_body: bool = false,
@@ -171,7 +171,7 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
 /// The 128-entry header array is deliberately NOT a field here. Defaulting a
 /// 4 KiB array inside a `= .{}` struct literal makes the compiler materialise
 /// an initialiser for it on every parse, which cost 5x on small-cl and 10x on
-/// zrk-1k when this struct was first written that way -- caught by bench-parse,
+/// zrk-1k when this struct was first written that way — caught by bench-parse,
 /// exactly as rule 8 intends. It stays an `undefined` local in `parseHead` and
 /// is passed by pointer, which also satisfies hparse's `Resume` contract that
 /// every resumed call see the SAME array.
@@ -291,7 +291,7 @@ fn applyFraming(head: *Head, name: []const u8, value: []const u8) Error!void {
         head.content_length = n;
     } else if (std.ascii.eqlIgnoreCase(name, "content-encoding")) {
         // `identity` means "no coding applied" and is the one value that
-        // needs nothing. Anything else -- including a LIST like "gzip, br",
+        // needs nothing. Anything else — including a LIST like "gzip, br",
         // which is why this is not an equality test against known names --
         // means the bytes on the wire are not the bytes the caller wants.
         // Recorded here and refused in `streamBody`, because whether it
@@ -326,7 +326,7 @@ pub fn streamBody(
 
     // Bodyless FIRST, and the order is the whole subtlety. A HEAD response
     // echoes the headers its GET would have sent, `content-encoding` among
-    // them, while carrying no body -- so refusing on the header alone would
+    // them, while carrying no body — so refusing on the header alone would
     // break every HEAD against a gzip-serving origin, and `ycs.head` is a
     // real caller. Nothing reaches a sink here, so nothing can be misread.
     if (head.bodyless(method)) return .{ .len = 0, .keep_alive = head.keep_alive };

@@ -20,6 +20,8 @@
 const std = @import("std");
 
 pub const parser = @import("parser.zig");
+pub const retry = @import("retry.zig");
+pub const RetryAfter = retry.RetryAfter;
 pub const Head = parser.Head;
 pub const HeadOptions = parser.HeadOptions;
 
@@ -29,6 +31,7 @@ const conn_mod = @import("connection.zig");
 pub const Connection = conn_mod.Connection;
 pub const Request = conn_mod.Request;
 pub const Response = conn_mod.Response;
+pub const StatusClass = conn_mod.StatusClass;
 pub const Sink = conn_mod.Sink;
 pub const Header = conn_mod.Header;
 pub const writeRequest = conn_mod.writeRequest;

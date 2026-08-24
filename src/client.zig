@@ -27,13 +27,13 @@ pub const FetchRequest = struct {
     /// Sent as `user-agent`. Null sends none.
     ///
     /// Defaulted because its ABSENCE is a failure a caller cannot diagnose
-    /// from a status -- GitHub rejects a UA-less request outright. Set your
+    /// from a status — GitHub rejects a UA-less request outright. Set your
     /// own to identify your service; nothing deduplicates against `extra`.
     user_agent: ?[]const u8 = connection.default_user_agent,
     extra: []const connection.Header = &.{},
     /// What to send as the request body. `.{ .bytes = "..." }` for something
     /// already in memory, `.{ .stream = .{ .source = r } }` to send it as it
-    /// is read -- see `connection.RequestBody`.
+    /// is read — see `connection.RequestBody`.
     ///
     /// A streamed body cannot be replayed, so a 307 or 308 that would resend
     /// it is `error.BodyNotReplayable` rather than a request with no body.
@@ -371,7 +371,7 @@ const Task = struct {
 
         // Programmer input: asking for hops without somewhere to build them is
         // a misconfiguration, and the first redirect would otherwise report
-        // TooManyRedirects -- true, but it would read as "the chain was long".
+        // TooManyRedirects — true, but it would read as "the chain was long".
         assert(req.redirects.max == 0 or req.redirects.buf.len > 0);
 
         var chain = req.redirects.buf;
@@ -860,7 +860,7 @@ test "fetch against a live loopback server, deadline against a black hole" {
     defer group.cancel(io);
     // `concurrent`: the origin must actually run beside the client. Under
     // plain `async` a host whose async_limit is exhausted runs Serve.run
-    // inline and the test deadlocks on its own server -- which is what a
+    // inline and the test deadlocks on its own server — which is what a
     // single-CPU run of this file did before fetch stopped using `async`.
     try group.concurrent(io, Serve.run, .{ &server, io });
 
@@ -887,7 +887,7 @@ test "a backend that cannot spawn refuses the fetch rather than running it unbou
     // concurrent_limit .nothing is the shape of an Io whose threads are all
     // committed: `concurrent` cannot promise a deadline sleeper. The old code
     // used `async`, which answers that by running the request INLINE with no
-    // deadline at all -- unbounded, on a host already out of resources. The
+    // deadline at all — unbounded, on a host already out of resources. The
     // contract now is that fetch says so before it dials.
     var threaded: Io.Threaded = .init(t.allocator, .{ .concurrent_limit = .nothing });
     defer threaded.deinit();

@@ -77,17 +77,39 @@ would have to allocate, and zurl does not.
 
 ```zig
 fn onHeader(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
-    const wait: *?u32 = @ptrCast(@alignCast(ctx.?));
-    if (std.ascii.eqlIgnoreCase(name, "retry-after"))
-        wait.* = std.fmt.parseInt(u32, value, 10) catch null;
+    const wait: *?zurl.RetryAfter = @ptrCast(@alignCast(ctx.?));
+    // First occurrence wins: a trailer can repeat a header name.
+    if (wait.* == null and std.ascii.eqlIgnoreCase(name, "retry-after"))
+        wait.* = zurl.retry.parse(value);
 }
 
-var retry_after: ?u32 = null;
+var retry_after: ?zurl.RetryAfter = null;
 const res = try zurl.fetch(io, .{
     .url = url,
     .on_header = onHeader,
     .ctx = &retry_after,
 }) orelse return error.TimedOut;
+```
+
+### Backing off
+
+zurl never retries — whether replaying a request is safe is something only you
+know, and a silent second `POST` is worse than any duplication it would save.
+What it does is give you the two things a retry loop needs, so you are not
+guessing a backoff or writing a date parser:
+
+```zig
+if (res.throttled()) {                  // 429 or 503
+    const wait_s: u64 = switch (retry_after orelse .{ .seconds = 1 }) {
+        .seconds => |s| s,
+        // A date may be in the past, which means "no delay".
+        .at_unix_s => |at| @intCast(@max(0, at - std.time.timestamp())),
+    };
+    // A cancelled sleep means the caller's own deadline fired, which is a
+    // reason to stop waiting, not an error to report.
+    io.sleep(.fromNanoseconds(wait_s * std.time.ns_per_s), .awake) catch {};
+}
+switch (res.class()) { .success => {}, .server_error => {}, else => {} }
 ```
 
 ### Redirects
@@ -111,7 +133,7 @@ flag: otherwise a redirect is a way to collect your bearer token.
 
 303 rewrites the method to GET and drops the body; 301 and 302 do that for a
 POST only, because that is the whole of the historical deviation RFC 9110
-permits -- a PUT or DELETE keeps both. 307 and 308 always keep both, and HEAD
+permits — a PUT or DELETE keeps both. 307 and 308 always keep both, and HEAD
 survives every one of them. The body of a 3xx that gets followed is never
 delivered to your sink.
 

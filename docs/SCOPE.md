@@ -188,8 +188,13 @@ status.
   `transfer-encoding: chunked` when it is not. A stream cannot be replayed, so
   a 307 or 308 that would resend it is `BodyNotReplayable` rather than a
   request with a silently empty body.
-* **`Retry-After` parsing and status classification.** The ingredients for a
-  retry, not the retry — see below.
+* **`Retry-After` parsing and status classification.** **Landed.**
+  `retry.parse` returns `RetryAfter{ .seconds | .at_unix_s }` -- a VALUE, not a
+  delay, because turning a date into "how long from now" needs a clock and
+  reaching for one would put an implicit time source inside the library.
+  `Response.class()` gives RFC 9110's five classes and `Response.throttled()`
+  answers the 429-or-503 question that spans two of them. Still no retry loop:
+  the ingredients, not the retry.
 * **A single-origin `Session` over one `Connection`.** `fetch` stays one-shot
   and keeps `connection: close`. Pagination over a dozen pages should not pay a
   dozen TLS handshakes: the measured gap is 88k req/s keep-alive against 14k

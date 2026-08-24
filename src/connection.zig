@@ -84,9 +84,53 @@ pub const Sink = union(enum) {
     stream: *Io.Writer,
 };
 
+/// The class of a status code, as RFC 9110 §15 divides them.
+///
+/// A caller deciding whether to retry needs this and `Response.throttled`;
+/// what it does with them is its own business, because whether replaying a
+/// request is safe is something only the caller knows (docs/SCOPE.md).
+pub const StatusClass = enum {
+    informational,
+    success,
+    redirect,
+    client_error,
+    server_error,
+};
+
 pub const Response = struct {
     status: u16,
     body_len: u64,
+
+    /// Which of RFC 9110's five classes this status belongs to.
+    pub fn class(r: Response) StatusClass {
+        // Range-checked by the parser before a Response can exist.
+        assert(r.status >= 100);
+        assert(r.status <= 999);
+
+        return switch (r.status / 100) {
+            1 => .informational,
+            2 => .success,
+            3 => .redirect,
+            4 => .client_error,
+            // 5xx, and also the 6xx-9xx no RFC defines. An origin sending one
+            // has malfunctioned, which is a server error by any reading — and
+            // the alternative, a sixth class, would make every caller handle a
+            // case that means nothing.
+            else => .server_error,
+        };
+    }
+
+    /// Whether the origin said "not now, try later".
+    ///
+    /// 429 and 503 are the two that carry `Retry-After` in practice and the
+    /// two where retrying is the intended response rather than a gamble. Kept
+    /// separate from `class` because they span two classes and mean one thing.
+    pub fn throttled(r: Response) bool {
+        assert(r.status >= 100);
+        assert(r.status <= 999);
+
+        return r.status == 429 or r.status == 503;
+    }
 
     pub fn ok(r: Response) bool {
         // A Response only ever comes from a round trip, which range-checked
@@ -163,7 +207,7 @@ pub const Connection = struct {
     /// exchange actually was — not from what the request asked for.
     pub fn roundTrip(c: *Connection, req: Request, sink: Sink, opts: parser.HeadOptions) Error!Response {
         // No assertion on `host` or `target` here. They are caller input, and
-        // `writeRequest` returns InvalidRequestTarget for an empty one -- an
+        // `writeRequest` returns InvalidRequestTarget for an empty one — an
         // assert would panic a consumer in Debug for a case the API already
         // answers with an error, and would vanish in ReleaseFast.
         if (!c.reusable) return error.ConnectionNotReusable;
@@ -224,7 +268,7 @@ pub const Connection = struct {
     /// the unread body is still on the wire — which is exactly the contract a
     /// warm probe wants (it closes the transport regardless).
     pub fn roundTripHead(c: *Connection, req: Request, opts: parser.HeadOptions) Error!parser.Head {
-        // Caller input, validated by `writeRequest` as an error -- see roundTrip.
+        // Caller input, validated by `writeRequest` as an error — see roundTrip.
         if (!c.reusable) return error.ConnectionNotReusable;
         // The body is deliberately left on the wire, so nothing downstream can
         // know where the next response would begin.
@@ -390,7 +434,7 @@ fn writeChunkedBody(out: *Io.Writer, source: *Io.Reader) (Io.Writer.Error || Req
     assert(source.buffered().len == 0);
 
     // A zero-length chunk terminates the body, and the second CRLF closes an
-    // empty trailer section -- a receiver reads both or keeps waiting.
+    // empty trailer section — a receiver reads both or keeps waiting.
     try out.writeAll("0\r\n\r\n");
 }
 
@@ -641,4 +685,30 @@ test "chunked framing survives a source that stalls and arrives in pieces" {
         "5\r\nalpha\r\n4\r\nbeta\r\n5\r\ngamma\r\n0\r\n\r\n",
         out.buffered()[body_start..],
     );
+}
+
+test "status classification separates the five classes from the two that mean try later" {
+    const cases = [_]struct { u16, StatusClass, bool }{
+        .{ 100, .informational, false },
+        .{ 200, .success, false },
+        .{ 204, .success, false },
+        .{ 302, .redirect, false },
+        .{ 404, .client_error, false },
+        // Throttling spans two classes and means one thing, which is why it
+        // is its own question rather than a sixth class.
+        .{ 429, .client_error, true },
+        .{ 500, .server_error, false },
+        .{ 503, .server_error, true },
+        // No RFC defines a 6xx. An origin sending one has malfunctioned, and
+        // calling that a server error is the only reading that does not
+        // invite a caller to treat it as success.
+        .{ 699, .server_error, false },
+    };
+
+    for (cases) |case| {
+        const status, const want_class, const want_throttled = case;
+        const res: Response = .{ .status = status, .body_len = 0 };
+        try t.expectEqual(want_class, res.class());
+        try t.expectEqual(want_throttled, res.throttled());
+    }
 }
