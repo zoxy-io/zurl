@@ -182,10 +182,12 @@ status.
 
 ## Tier 2 — for remote API work generally
 
-* **Streaming request bodies.** `body` is `?[]const u8`, so `ycs.put` holds a
-  whole artifact in memory. A `*Io.Reader` source plus request-side chunked
-  encoding for unknown length. This was a v0 non-goal on the grounds that
-  nothing needed it; uploads are what change that.
+* **Streaming request bodies.** **Landed.** `body` is a `RequestBody` union:
+  `bytes` for something in memory, `stream` for a `*Io.Reader` sent as it is
+  read -- with a `content-length` when the length is known and
+  `transfer-encoding: chunked` when it is not. A stream cannot be replayed, so
+  a 307 or 308 that would resend it is `BodyNotReplayable` rather than a
+  request with a silently empty body.
 * **`Retry-After` parsing and status classification.** The ingredients for a
   retry, not the retry — see below.
 * **A single-origin `Session` over one `Connection`.** `fetch` stays one-shot
@@ -193,6 +195,18 @@ status.
   dozen TLS handshakes: the measured gap is 88k req/s keep-alive against 14k
   fresh-connection. `Connection` already does this; what is missing is a
   documented, bounded way to hold one open for an origin.
+* **Refuse a framing header in `extra`.** `validate` checks that every `extra`
+  header name is a token, but not *which* token: a caller can pair
+  `.extra = &.{.{ .name = "content-length", .value = "0" }}` with a real body
+  and put two framing headers on the wire. That is the same disagreement the
+  parser already refuses on the RESPONSE side as a smuggling primitive
+  (rule 2), so refusing `content-length`, `transfer-encoding` and `host` in
+  `extra` is the symmetric fix.
+
+  Pre-existing — it was equally true when bodies were only `[]const u8` — and
+  found while reviewing streaming bodies, which widened who would benefit from
+  it. Scheduled rather than folded into that slice, because it is a change to
+  what `extra` means rather than to how a body is sent.
 * **Basic-auth helper** — base64 into a caller buffer, mostly for the CLI.
 * **Percent-encoding for URL building.** The ergonomic half of the refusal item
   in Tier 1: refusing a bad target tells a caller it built a wrong URL, and an

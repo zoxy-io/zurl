@@ -31,7 +31,13 @@ pub const FetchRequest = struct {
     /// own to identify your service; nothing deduplicates against `extra`.
     user_agent: ?[]const u8 = connection.default_user_agent,
     extra: []const connection.Header = &.{},
-    body: ?[]const u8 = null,
+    /// What to send as the request body. `.{ .bytes = "..." }` for something
+    /// already in memory, `.{ .stream = .{ .source = r } }` to send it as it
+    /// is read -- see `connection.RequestBody`.
+    ///
+    /// A streamed body cannot be replayed, so a 307 or 308 that would resend
+    /// it is `error.BodyNotReplayable` rather than a request with no body.
+    body: ?connection.RequestBody = null,
     sink: connection.Sink = .discard,
     /// Called once per RESPONSE header, and again for each chunked trailer.
     /// Names arrive as the origin sent them; values are trimmed of leading and
@@ -129,6 +135,11 @@ pub const Error = error{
     /// A 3xx that cannot be followed — no `location`, or one that does not
     /// resolve to an http/https URL.
     InvalidRedirect,
+    /// A 307 or 308 asked for the body to be resent, and the body was a
+    /// stream that has already been consumed. Refused rather than silently
+    /// resent as an EMPTY body, which the origin would accept as a perfectly
+    /// good request that is not the one the caller made.
+    BodyNotReplayable,
     /// An https URL arrived with no `tls` config. Distinct from a TLS
     /// failure: nothing was dialed and nothing was wrong with the peer.
     TlsNotConfigured,
@@ -322,7 +333,7 @@ const HeadWatch = struct {
 const Hop = struct {
     uri: std.Uri,
     method: std.http.Method,
-    body: ?[]const u8,
+    body: ?connection.RequestBody,
     authorization: ?[]const u8,
 };
 
@@ -409,6 +420,15 @@ const Task = struct {
         if (!isHttpScheme(to.scheme)) return error.InvalidRedirect;
 
         const next = Redirect.next(redirectKind(status).?, from.method);
+
+        // A stream is gone once it has been sent. Following anyway would put
+        // an empty body on a PUT the origin will happily accept — a different
+        // request than the caller made, reported as success.
+        if (next.keep_body) {
+            if (from.body) |body| {
+                if (!body.replayable()) return error.BodyNotReplayable;
+            }
+        }
         return .{
             .uri = to,
             .method = next.method,
@@ -1104,7 +1124,7 @@ test "a followed redirect rewrites the method, drops the body, and delivers only
     const res = (try fetch(io, .{
         .url = url,
         .method = .POST,
-        .body = "payload",
+        .body = .{ .bytes = "payload" },
         .content_type = "text/plain",
         .sink = .{ .collect = &body },
         .redirects = .{ .max = 3, .buf = &hop_buf },
@@ -1332,7 +1352,7 @@ test "302 rewrites only POST; DELETE keeps its method and body" {
     const res = (try fetch(io, .{
         .url = url,
         .method = .DELETE,
-        .body = "why",
+        .body = .{ .bytes = "why" },
         .redirects = .{ .max = 2, .buf = &hop_buf },
     })).?;
 
@@ -1342,4 +1362,100 @@ test "302 rewrites only POST; DELETE keeps its method and body" {
     // Method preserved, and so is the body it was carrying.
     try t.expect(std.mem.startsWith(u8, seen[1][0..], "DELETE /moved "));
     try t.expect(std.mem.indexOf(u8, seen[1][0..], "content-length: 3") != null);
+}
+
+test "a redirect that would replay a streamed body is refused, not sent empty" {
+    // 307 says "same body" outright. A 302 on a PUT keeps it too, because the
+    // historical rewrite is POST-only — so both reach the same refusal, and
+    // testing only the obvious one would leave the other to a reader's faith.
+    for ([_]u16{ 307, 302 }) |status| try streamReplayRefused(status);
+}
+
+fn streamReplayRefused(status: u16) !void {
+    // 307 means "same method, same body", and a stream has none left to give.
+    // Sending the request anyway would PUT an empty object and report 200 —
+    // the origin cannot tell it was not what the caller meant, and neither
+    // could the caller.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const redirect = if (status == 307)
+        "HTTP/1.1 307 Temporary Redirect\r\nlocation: /elsewhere\r\ncontent-length: 0\r\n\r\n"
+    else
+        "HTTP/1.1 302 Found\r\nlocation: /elsewhere\r\ncontent-length: 0\r\n\r\n";
+    const responses = [_][]const u8{ redirect, "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok" };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/object", .{port});
+
+    var payload: Io.Reader = .fixed("artifact bytes");
+    var hop_buf: [2048]u8 = undefined;
+    try t.expectError(error.BodyNotReplayable, fetch(io, .{
+        .url = url,
+        .method = .PUT,
+        .body = .{ .stream = .{ .source = &payload, .len = 14 } },
+        .redirects = .{ .max = 2, .buf = &hop_buf },
+    }));
+
+    // The first hop really was sent — this is a refusal to CONTINUE, not a
+    // refusal to start, so the caller knows the origin saw the upload.
+    try t.expectEqual(@as(usize, 1), seen_len);
+    try t.expect(std.mem.startsWith(u8, seen[0][0..], "PUT /object "));
+}
+
+test "a 303 after a streamed body is fine, because it drops the body anyway" {
+    // The complement: refusing every redirect after a stream would be too
+    // strict. A 303 rewrites to GET and carries no body, so there is nothing
+    // to replay and nothing to refuse.
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const responses = [_][]const u8{
+        "HTTP/1.1 303 See Other\r\nlocation: /receipt\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nreceipt",
+    };
+    var seen: [4][256]u8 = undefined;
+    var seen_len: usize = 0;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, serveSeq, .{ &server, io, responses[0..], &seen, &seen_len });
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/upload", .{port});
+
+    var payload: Io.Reader = .fixed("artifact bytes");
+    var hop_buf: [2048]u8 = undefined;
+    var body: Io.Writer.Allocating = .init(t.allocator);
+    defer body.deinit();
+    const res = (try fetch(io, .{
+        .url = url,
+        .method = .POST,
+        .body = .{ .stream = .{ .source = &payload, .len = 14 } },
+        .sink = .{ .collect = &body },
+        .redirects = .{ .max = 2, .buf = &hop_buf },
+    })).?;
+
+    try t.expectEqual(@as(u16, 200), res.status);
+    try t.expectEqualStrings("receipt", body.written());
+    try t.expect(std.mem.startsWith(u8, seen[0][0..], "POST /upload "));
+    try t.expect(std.mem.startsWith(u8, seen[1][0..], "GET /receipt "));
 }

@@ -25,6 +25,33 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 /// means something; the fix then is a build option, not a sharper comment.
 pub const default_user_agent = "zurl/0.0.0";
 
+/// Where a request body comes from.
+///
+/// `bytes` was the whole of it in v0, on the grounds that nothing needed more.
+/// Uploads are what changed that: `ycs.put` holds an entire artifact in memory
+/// only because there was no other way to hand one over.
+pub const RequestBody = union(enum) {
+    /// Already in memory. Sent with a `content-length`.
+    bytes: []const u8,
+    /// Read from `source` as it is sent, so the body is never held whole.
+    ///
+    /// A known `len` is sent with a `content-length` and the source must
+    /// deliver exactly that many bytes — running short is an error, because
+    /// the length has already gone out and the origin is counting. A null
+    /// `len` is sent with `transfer-encoding: chunked`, which is how a body of
+    /// unknown size is framed.
+    stream: struct {
+        source: *Io.Reader,
+        len: ?u64 = null,
+    },
+
+    /// A stream can only be sent once, so a redirect that would replay the
+    /// body cannot. Callers of `writeRequest` do not care; `fetch` does.
+    pub fn replayable(body: *const RequestBody) bool {
+        return body.* == .bytes;
+    }
+};
+
 pub const Request = struct {
     method: std.http.Method = .GET,
     /// origin-form target: path plus optional query, e.g. "/metrics".
@@ -40,9 +67,8 @@ pub const Request = struct {
     /// both set sends the header twice.
     user_agent: ?[]const u8 = default_user_agent,
     extra: []const Header = &.{},
-    /// Body bytes, sent with an automatic Content-Length. No request-side
-    /// chunked encoding in v0 (nothing in either repo needs it).
-    body: ?[]const u8 = null,
+    /// What to send as the request body, if anything.
+    body: ?RequestBody = null,
     /// When false, sends `connection: close` — the reply then has somewhere
     /// to stop even if the server can't frame it (the benchmark's a60a95c).
     keep_alive: bool = true,
@@ -96,6 +122,11 @@ pub const RequestError = error{
     /// A header name is not a token, or a value carries a byte that cannot
     /// appear in a field value. Same injection, one line further down.
     InvalidRequestHeader,
+    /// A streamed request body failed part-way, or ended before the
+    /// `content-length` already sent for it. Distinct from `WriteFailed`,
+    /// which is the transport: this is the caller's own source, and the
+    /// connection is desynchronised either way.
+    RequestBodyFailed,
 };
 
 pub const Connection = struct {
@@ -291,12 +322,76 @@ pub fn writeRequest(out: *Io.Writer, req: Request) (Io.Writer.Error || RequestEr
     if (req.user_agent) |ua| try out.print("user-agent: {s}\r\n", .{ua});
     if (req.authorization) |a| try out.print("authorization: {s}\r\n", .{a});
     if (req.content_type) |ct| try out.print("content-type: {s}\r\n", .{ct});
-    if (req.body) |b| try out.print("content-length: {d}\r\n", .{b.len});
+    // Exactly one framing header, and which one is the body's own business.
+    if (req.body) |body| switch (body) {
+        .bytes => |b| try out.print("content-length: {d}\r\n", .{b.len}),
+        .stream => |s| if (s.len) |len|
+            try out.print("content-length: {d}\r\n", .{len})
+        else
+            try out.writeAll("transfer-encoding: chunked\r\n"),
+    };
     if (!req.keep_alive) try out.writeAll("connection: close\r\n");
     for (req.extra) |h| try out.print("{s}: {s}\r\n", .{ h.name, h.value });
     try out.writeAll("\r\n");
-    if (req.body) |b| try out.writeAll(b);
+
+    if (req.body) |body| switch (body) {
+        .bytes => |b| try out.writeAll(b),
+        .stream => |s| if (s.len) |len| {
+            // The length is already on the wire, so a source that runs short
+            // has desynchronised the connection: the origin will wait for
+            // bytes that are never coming.
+            s.source.streamExact64(out, len) catch |err| return switch (err) {
+                error.WriteFailed => error.WriteFailed,
+                error.ReadFailed, error.EndOfStream => error.RequestBodyFailed,
+            };
+        } else try writeChunkedBody(out, s.source),
+    };
     try out.flush();
+}
+
+/// Send `source` to exhaustion as chunked transfer-encoding.
+///
+/// Zero-copy: the reader's own buffered bytes become the chunk, so nothing is
+/// staged through a second buffer. That also makes the chunk sizes whatever
+/// the source happens to hand over, which is fine — chunk boundaries carry no
+/// meaning, and a receiver that believes otherwise is the bug rule 4 is about.
+fn writeChunkedBody(out: *Io.Writer, source: *Io.Reader) (Io.Writer.Error || RequestError)!void {
+    // lint:unbounded-ok — bounded by the caller's deadline (rule 3), NOT by
+    // the source being finite, and the distinction is the same one
+    // `parser.scanHead` makes about the identical `fillMore` behaviour.
+    //
+    // Each pass either sends buffered bytes and tosses them, fills, or breaks
+    // at end of stream. But `fillMore` documents that it may add zero bytes
+    // without signalling EOF, and nothing stops `source` from wrapping a live
+    // transport — piping one response body into the next request is exactly
+    // the shape streaming exists for. So a source that never progresses and
+    // never ends keeps this running, bounded by whatever is producing it.
+    // `fetch` supplies rule 3's deadline; a caller driving `Connection`
+    // directly owns that choice. Claiming "finite by construction" here would
+    // be asserting a guarantee `scanHead` explicitly disclaims.
+    while (true) {
+        const chunk = source.buffered();
+        if (chunk.len == 0) {
+            source.fillMore() catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.RequestBodyFailed,
+            };
+            continue;
+        }
+
+        try out.print("{x}\r\n", .{chunk.len});
+        try out.writeAll(chunk);
+        try out.writeAll("\r\n");
+        source.toss(chunk.len);
+    }
+
+    // The loop only breaks at a real end of stream, so the source is drained
+    // and the zero-length chunk that follows is the truth rather than a guess.
+    assert(source.buffered().len == 0);
+
+    // A zero-length chunk terminates the body, and the second CRLF closes an
+    // empty trailer section -- a receiver reads both or keeps waiting.
+    try out.writeAll("0\r\n\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +437,7 @@ test "request serialization: auth, content-type, body, close" {
         .host = "storage",
         .authorization = "Bearer tok",
         .content_type = "application/json",
-        .body = "{}",
+        .body = .{ .bytes = "{}" },
         .keep_alive = false,
     });
     const sent = out.buffered();
@@ -431,4 +526,119 @@ test "a user-agent is sent by default, suppressible, and validated like any valu
         .user_agent = "evil\r\nX-Injected: 1",
     }));
     try t.expectEqual(@as(usize, 0), out3.end);
+}
+
+test "a streamed body is framed by its length, or chunked when it has none" {
+    // The point of streaming: `ycs.put` held a whole artifact in memory only
+    // because bytes was the only shape there was.
+
+    // Known length: content-length, and the bytes go out verbatim.
+    var src1: Io.Reader = .fixed("hello world");
+    var buf1: [512]u8 = undefined;
+    var out1: Io.Writer = .fixed(&buf1);
+    try writeRequest(&out1, .{
+        .host = "h",
+        .method = .PUT,
+        .body = .{ .stream = .{ .source = &src1, .len = 11 } },
+    });
+    try t.expect(std.mem.indexOf(u8, out1.buffered(), "content-length: 11\r\n") != null);
+    try t.expect(std.mem.indexOf(u8, out1.buffered(), "transfer-encoding") == null);
+    try t.expect(std.mem.endsWith(u8, out1.buffered(), "\r\n\r\nhello world"));
+
+    // Unknown length: chunked, terminated by the zero chunk.
+    var src2: Io.Reader = .fixed("hello world");
+    var buf2: [512]u8 = undefined;
+    var out2: Io.Writer = .fixed(&buf2);
+    try writeRequest(&out2, .{
+        .host = "h",
+        .method = .PUT,
+        .body = .{ .stream = .{ .source = &src2 } },
+    });
+    try t.expect(std.mem.indexOf(u8, out2.buffered(), "transfer-encoding: chunked\r\n") != null);
+    try t.expect(std.mem.indexOf(u8, out2.buffered(), "content-length") == null);
+    try t.expect(std.mem.endsWith(u8, out2.buffered(), "\r\n\r\nb\r\nhello world\r\n0\r\n\r\n"));
+
+    // An empty source is still a well-framed chunked body, not a hang.
+    var src3: Io.Reader = .fixed("");
+    var buf3: [512]u8 = undefined;
+    var out3: Io.Writer = .fixed(&buf3);
+    try writeRequest(&out3, .{ .host = "h", .method = .PUT, .body = .{ .stream = .{ .source = &src3 } } });
+    try t.expect(std.mem.endsWith(u8, out3.buffered(), "\r\n\r\n0\r\n\r\n"));
+}
+
+test "a source that runs short of its declared length is an error, not a silent truncation" {
+    // The content-length is already on the wire, so the origin is counting.
+    // Reporting success here would leave the connection desynchronised and
+    // the object half-written — exactly the class rule 7 refuses.
+    var src: Io.Reader = .fixed("only七");
+    var buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try t.expectError(error.RequestBodyFailed, writeRequest(&out, .{
+        .host = "h",
+        .method = .PUT,
+        .body = .{ .stream = .{ .source = &src, .len = 9999 } },
+    }));
+}
+
+/// A reader that hands over one piece at a time and sometimes makes no
+/// progress at all, which `Io.Reader.fixed` never does.
+///
+/// `fillMore` returning zero bytes WITHOUT signalling end of stream is
+/// documented std behaviour and is the case `writeChunkedBody`'s bound is
+/// written about — a TLS transport consuming a session ticket does exactly
+/// this. Without a reader that reproduces it, that loop is only ever tested
+/// on the one-chunk-then-EOF path.
+const StutteringReader = struct {
+    interface: Io.Reader,
+    pieces: []const []const u8,
+    next: usize = 0,
+    /// Zero-progress fills still owed before the next piece is handed over.
+    stalls: usize,
+    stalls_per_piece: usize,
+
+    fn init(buffer: []u8, pieces: []const []const u8, stalls_per_piece: usize) StutteringReader {
+        return .{
+            .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .pieces = pieces,
+            .stalls = stalls_per_piece,
+            .stalls_per_piece = stalls_per_piece,
+        };
+    }
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *StutteringReader = @alignCast(@fieldParentPtr("interface", r));
+        if (self.next == self.pieces.len) return error.EndOfStream;
+        if (self.stalls > 0) {
+            self.stalls -= 1;
+            // No bytes, no error: exactly what std permits and what the bound
+            // in `writeChunkedBody` has to survive.
+            return 0;
+        }
+        self.stalls = self.stalls_per_piece;
+        const piece = self.pieces[self.next];
+        self.next += 1;
+        return w.write(limit.sliceConst(piece)) catch return error.WriteFailed;
+    }
+};
+
+test "chunked framing survives a source that stalls and arrives in pieces" {
+    // Three pieces become three chunks, and the zero-progress fills between
+    // them must neither emit a chunk nor terminate the body early: a `0`
+    // chunk mid-stream would end the request where the source had not.
+    var read_buf: [64]u8 = undefined;
+    var src = StutteringReader.init(&read_buf, &.{ "alpha", "beta", "gamma" }, 2);
+
+    var buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try writeRequest(&out, .{
+        .host = "h",
+        .method = .POST,
+        .body = .{ .stream = .{ .source = &src.interface } },
+    });
+
+    const body_start = std.mem.indexOf(u8, out.buffered(), "\r\n\r\n").? + 4;
+    try t.expectEqualStrings(
+        "5\r\nalpha\r\n4\r\nbeta\r\n5\r\ngamma\r\n0\r\n\r\n",
+        out.buffered()[body_start..],
+    );
 }
