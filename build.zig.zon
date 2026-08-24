@@ -34,6 +34,7 @@
         "bench",
         "smoke",
         "cli",
+        "LICENSE",
         "README.md",
     },
 }

@@ -240,6 +240,11 @@ Methodology, the A/B bands behind those figures, and what assertions cost live
 with [rule 8](docs/DESIGN.md); the comparison against std is in
 [docs/RESEARCH.md](docs/RESEARCH.md).
 
+## Licence
+
+MIT â see [LICENSE](LICENSE), the same terms as the sibling `zoxy` and `zrk`
+repositories.
+
 ## Docs
 
 | | |
