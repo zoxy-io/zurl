@@ -242,7 +242,7 @@ with [rule 8](docs/DESIGN.md); the comparison against std is in
 
 ## Licence
 
-MIT â see [LICENSE](LICENSE), the same terms as the sibling `zoxy` and `zrk`
+MIT — see [LICENSE](LICENSE), the same terms as the sibling `zoxy` and `zrk`
 repositories.
 
 ## Docs
