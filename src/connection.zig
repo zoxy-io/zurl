@@ -57,7 +57,12 @@ pub const Request = struct {
     /// origin-form target: path plus optional query, e.g. "/metrics".
     target: []const u8 = "/",
     /// Sent as the Host header — mandatory in HTTP/1.1.
-    host: []const u8,
+    ///
+    /// Defaulted to empty only so `Session` can fill it in for a caller that
+    /// has already named the origin once. Reaching `writeRequest` empty is
+    /// `InvalidRequestTarget`, so a direct `Connection` caller who forgets it
+    /// is told at the first request rather than sending a headless one.
+    host: []const u8 = "",
     /// Convenience for the two headers every control-plane caller in the
     /// benchmark repo sets; anything else goes in `extra`.
     authorization: ?[]const u8 = null,

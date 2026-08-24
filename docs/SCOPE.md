@@ -195,11 +195,12 @@ status.
   `Response.class()` gives RFC 9110's five classes and `Response.throttled()`
   answers the 429-or-503 question that spans two of them. Still no retry loop:
   the ingredients, not the retry.
-* **A single-origin `Session` over one `Connection`.** `fetch` stays one-shot
-  and keeps `connection: close`. Pagination over a dozen pages should not pay a
-  dozen TLS handshakes: the measured gap is 88k req/s keep-alive against 14k
-  fresh-connection. `Connection` already does this; what is missing is a
-  documented, bounded way to hold one open for an origin.
+* **A single-origin `Session` over one `Connection`.** **Landed.** `fetch`
+  stays one-shot and keeps `connection: close`; `Session` resolves a URL,
+  dials it, and stands up a transport whose buffers outlive one request -- the
+  part `Connection` deliberately does not do. Buffers are the caller's, as
+  everywhere else. It does NOT reconnect on its own: reconnecting means
+  resending, which is the question retry asks and gets the same answer.
 * **Refuse a framing header in `extra`.** `validate` checks that every `extra`
   header name is a token, but not *which* token: a caller can pair
   `.extra = &.{.{ .name = "content-length", .value = "0" }}` with a real body

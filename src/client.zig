@@ -165,6 +165,149 @@ pub const Error = error{
 /// never copied anywhere.
 const host_bytes_max: usize = 253;
 
+/// The three things a URL says about where to connect.
+///
+/// Extracted so `fetch` and `Session` cannot disagree about what a URL means:
+/// which scheme is dialable, what port a missing one implies, and how long a
+/// host may be.
+pub const Origin = struct {
+    secure: bool,
+    /// A slice of the caller's URL, never copied.
+    host: []const u8,
+    port: u16,
+
+    pub fn of(uri: std.Uri) Error!Origin {
+        const secure = scheme: {
+            if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) break :scheme true;
+            if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) break :scheme false;
+            return error.InvalidUrl;
+        };
+
+        // Port 0 means "let the kernel choose" to a listener and nothing at
+        // all to a dialer, so it is a bad URL rather than an assertion: it
+        // reaches us from whatever string the caller was handed.
+        const port: u16 = uri.port orelse if (secure) 443 else 80;
+        if (port == 0) return error.InvalidUrl;
+
+        const host = hostBytes(&uri) orelse return error.InvalidUrl;
+        if (host.len == 0 or host.len > host_bytes_max) return error.InvalidUrl;
+
+        return .{ .secure = secure, .host = host, .port = port };
+    }
+
+    /// Connect, by IP literal when the host is one and by name otherwise.
+    pub fn dial(origin: Origin, io: Io) Error!net.Stream {
+        assert(origin.host.len > 0);
+        assert(origin.port != 0);
+
+        if (net.IpAddress.parse(origin.host, origin.port)) |addr| {
+            return addr.connect(io, .{ .mode = .stream }) catch error.ConnectFailed;
+        } else |_| {
+            const name = net.HostName.init(origin.host) catch return error.InvalidUrl;
+            return name.connect(io, origin.port, .{ .mode = .stream }) catch error.ConnectFailed;
+        }
+    }
+};
+
+/// Buffers a transport holds for as long as it is open.
+///
+/// Caller-supplied, because zurl allocates nothing, and named separately from
+/// any request because they outlive one: a `fetch` keeps these on its own
+/// stack frame, and anything longer-lived cannot.
+pub const Buffers = struct {
+    /// Bounds the longest response head the parser can see. For https this is
+    /// the PLAINTEXT read buffer.
+    read: []u8,
+    /// Request bytes staged before they go out. For https, plaintext.
+    write: []u8,
+    /// https only, unused for http. Each must be at least
+    /// `tls.buffer_bytes_min`, because each holds one whole ciphertext record.
+    ciphertext_in: []u8 = &.{},
+    ciphertext_out: []u8 = &.{},
+};
+
+/// A dialed origin with its transport standing: the socket, its reader and
+/// writer, and a TLS session when the origin is https.
+///
+/// This exists so that the socket stays in `client.zig`, which rule 5 makes
+/// the only file allowed to dial. Anything longer-lived than a `fetch` —
+/// `Session` today — holds one of these and never names a socket type, so the
+/// seam stays one file wide instead of two.
+///
+/// **Not movable once open.** `reader` and `writer` point into fields of this
+/// struct, which is why `open` takes a pointer.
+pub const Dialed = struct {
+    io: Io,
+    secure: bool,
+    stream: net.Stream,
+    socket_reader: net.Stream.Reader,
+    socket_writer: net.Stream.Writer,
+    /// Meaningful only when `secure`. A plain `undefined` rather than an
+    /// optional: unwrapping an optional whose payload was just written as
+    /// `undefined` leans on compiler behaviour no language reference promises,
+    /// and `secure` already answers the only question anyone asks of it.
+    ///
+    /// The cost is that a plain-HTTP `Dialed` still carries std.crypto.tls's
+    /// kilobyte-plus of cipher state. That is the cost `attempt` splits its
+    /// two exchange frames to avoid -- and it is worth paying here and not
+    /// there, because a `Dialed` is long-lived and per-session while those
+    /// frames are per-request and on a hot path.
+    tls: tls_transport.Transport,
+
+    pub fn open(dialed: *Dialed, io: Io, origin: Origin, buffers: Buffers, config: ?tls_transport.Config) Error!void {
+        assert(buffers.read.len > 0);
+        assert(buffers.write.len > 0);
+
+        if (origin.secure and config == null) return error.TlsNotConfigured;
+
+        dialed.* = .{
+            .io = io,
+            .secure = origin.secure,
+            .stream = try origin.dial(io),
+            .socket_reader = undefined,
+            .socket_writer = undefined,
+            .tls = undefined,
+        };
+        errdefer dialed.stream.close(io);
+
+        // The socket's own buffers are the ciphertext side for https and the
+        // whole story for http, which is the only difference between the arms.
+        const socket_read = if (origin.secure) buffers.ciphertext_in else buffers.read;
+        const socket_write = if (origin.secure) buffers.ciphertext_out else buffers.write;
+        dialed.socket_reader = dialed.stream.reader(io, socket_read);
+        dialed.socket_writer = dialed.stream.writer(io, socket_write);
+
+        if (!origin.secure) return;
+
+        try dialed.tls.init(.{
+            .io = io,
+            .input = &dialed.socket_reader.interface,
+            .output = &dialed.socket_writer.interface,
+            .host = origin.host,
+            .read_buffer = buffers.read,
+            .write_buffer = buffers.write,
+            .config = config.?,
+        });
+    }
+
+    pub fn reader(dialed: *Dialed) *Io.Reader {
+        return if (dialed.secure) dialed.tls.reader() else &dialed.socket_reader.interface;
+    }
+
+    pub fn writer(dialed: *Dialed) *Io.Writer {
+        return if (dialed.secure) dialed.tls.writer() else &dialed.socket_writer.interface;
+    }
+
+    /// Only valid on a `Dialed` that `open` returned successfully for — before
+    /// that, every field is `undefined`.
+    pub fn close(dialed: *Dialed) void {
+        // close_notify before the socket goes, so the peer can tell a finished
+        // session from a truncation.
+        if (dialed.secure) dialed.tls.close();
+        dialed.stream.close(dialed.io);
+    }
+};
+
 /// The origin-form request target for `uri`: path, plus query when present,
 /// written into `buf` and validated.
 ///
@@ -452,44 +595,19 @@ const Task = struct {
         const req = task.req;
         const uri = hop.uri;
 
-        const secure = scheme: {
-            if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) break :scheme true;
-            if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) break :scheme false;
-            return error.InvalidUrl;
-        };
+        const origin = try Origin.of(uri);
         // Refused before the dial, not after: an https URL with no trust
         // configuration is a caller mistake, and finding that out only once a
         // connection is open wastes a round trip and a socket.
-        if (secure and req.tls == null) return error.TlsNotConfigured;
-
-        // Port 0 means "let the kernel choose" to a listener and nothing at all
-        // to a dialer, so it is a bad URL rather than an assertion: it reaches
-        // us from whatever string the caller was handed.
-        const port: u16 = uri.port orelse if (secure) 443 else 80;
-        if (port == 0) return error.InvalidUrl;
-
-        const host_component = uri.host orelse return error.InvalidUrl;
-        const host = switch (host_component) {
-            .raw => |h| h,
-            .percent_encoded => |h| h,
-        };
-        if (host.len == 0 or host.len > host_bytes_max) return error.InvalidUrl;
+        if (origin.secure and req.tls == null) return error.TlsNotConfigured;
+        const host = origin.host;
 
         // Built BEFORE the dial, so a URL that cannot become a request line
         // costs nothing — the same reason TlsNotConfigured is checked above.
         var target_buf: [2048]u8 = undefined;
         const target = try originFormTarget(uri, host, &target_buf);
 
-        // One buffer serves the whole exchange: dial by IP literal when the
-        // host is one, by name otherwise.
-        var stream: net.Stream = blk: {
-            if (net.IpAddress.parse(host, port)) |addr| {
-                break :blk addr.connect(io, .{ .mode = .stream }) catch return error.ConnectFailed;
-            } else |_| {
-                const name = net.HostName.init(host) catch return error.InvalidUrl;
-                break :blk name.connect(io, port, .{ .mode = .stream }) catch return error.ConnectFailed;
-            }
-        };
+        var stream = try origin.dial(io);
         defer stream.close(io);
 
         // The two transports get their own frames on purpose. TLS needs four
@@ -497,7 +615,7 @@ const Task = struct {
         // its frame is ~66 KiB; a plain-HTTP fetch has no business reserving
         // that. Zig sizes a frame for all of its own locals, not for the
         // branch taken, so the split is what keeps the http path at 20 KiB.
-        if (secure) return task.exchangeTls(&stream, host, target, hop, watch, may_follow);
+        if (origin.secure) return task.exchangeTls(&stream, host, target, hop, watch, may_follow);
         return task.exchangePlain(&stream, host, target, hop, watch, may_follow);
     }
 

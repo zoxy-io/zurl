@@ -42,6 +42,9 @@ pub const validateTarget = conn_mod.validateTarget;
 pub const tls = @import("tls.zig");
 
 const client = @import("client.zig");
+pub const session = @import("session.zig");
+pub const Session = session.Session;
+
 pub const fetch = client.fetch;
 pub const FetchRequest = client.FetchRequest;
 pub const default_deadline_ns = client.default_deadline_ns;
