@@ -171,6 +171,18 @@ pub const RequestError = error{
     /// A header name is not a token, or a value carries a byte that cannot
     /// appear in a field value. Same injection, one line further down.
     InvalidRequestHeader,
+    /// An `extra` header names something `writeRequest` decides for itself.
+    ///
+    /// Sending both puts two framing headers on one request, which is the
+    /// same disagreement the parser refuses on the RESPONSE side as a
+    /// smuggling primitive (rule 2): an intermediary and an origin can pick
+    /// different ones and disagree about where the body ends.
+    ///
+    /// Only the headers zurl OWNS are reserved. `authorization`,
+    /// `content-type` and `user-agent` are not, because each has a field that
+    /// can be nulled — supplying your own through `extra` is a documented way
+    /// to use them, and refusing it would break the advice.
+    ReservedRequestHeader,
     /// A streamed request body failed part-way, or ended before the
     /// `content-length` already sent for it. Distinct from `WriteFailed`,
     /// which is the transport: this is the caller's own source, and the
@@ -330,6 +342,40 @@ pub fn validateTarget(target: []const u8, host: []const u8) RequestError!void {
     for (host) |b| if (!isTargetByte(b)) return error.InvalidRequestTarget;
 }
 
+/// Whether `writeRequest` decides this header for itself.
+///
+/// These four are not "headers zurl happens to send" — they are the ones that
+/// say where the request goes and where its body ends. A second copy from
+/// `extra` does not add a header, it creates a disagreement, and which one
+/// wins is up to whatever reads the request next.
+fn isReserved(name: []const u8) bool {
+    const reserved = [_][]const u8{
+        // Both framing. Two of either is the request-smuggling primitive.
+        "content-length",
+        "transfer-encoding",
+        // Routing: the origin picks a virtual host from this, and zurl already
+        // dialled one. Disagreeing sends a request to a host it did not open.
+        "host",
+        // zurl sets this from `keep_alive`, and the connection's reuse
+        // bookkeeping is built on what it sent.
+        "connection",
+        // Not a header zurl sends — a header that changes how many responses
+        // come back. An origin honouring `Expect: 100-continue` answers with
+        // an interim `100 Continue` and THEN the real response, and
+        // `parseHead` has no loop for that: it would return status 100 with
+        // the real status line still unread, and the next request on the
+        // connection would parse stale bytes. Refused until interim
+        // responses are handled, because "the caller asked for it" does not
+        // make a desynchronised connection the caller's fault.
+        "expect",
+    };
+
+    for (reserved) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+    return false;
+}
+
 /// Reject anything that cannot appear where it is about to be interpolated.
 ///
 /// This is the whole of the request-injection defence, and it lives here
@@ -353,6 +399,7 @@ fn validate(req: Request) RequestError!void {
         if (h.name.len == 0) return error.InvalidRequestHeader;
         for (h.name) |b| if (!isTokenByte(b)) return error.InvalidRequestHeader;
         for (h.value) |b| if (!isFieldValueByte(b)) return error.InvalidRequestHeader;
+        if (isReserved(h.name)) return error.ReservedRequestHeader;
     }
 }
 
@@ -716,4 +763,47 @@ test "status classification separates the five classes from the two that mean tr
         try t.expectEqual(want_class, res.class());
         try t.expectEqual(want_throttled, res.throttled());
     }
+}
+
+test "an extra header that zurl decides for itself is refused" {
+    // Two framing headers on one request is the same disagreement the parser
+    // refuses on the response side: an intermediary and an origin can pick
+    // different ones and disagree about where the body ends.
+    const reserved = [_][]const u8{
+        "content-length", "Content-Length", "transfer-encoding",
+        "host",           "HOST",           "connection",
+        // Not a header zurl sends, but one that changes how many responses
+        // come back: parseHead has no interim-response loop, so a 100
+        // Continue would be returned as the answer with the real status
+        // line left on the wire.
+        "expect",         "Expect",
+    };
+    for (reserved) |name| {
+        var buf: [512]u8 = undefined;
+        var out: Io.Writer = .fixed(&buf);
+        try t.expectError(error.ReservedRequestHeader, writeRequest(&out, .{
+            .host = "h",
+            .body = .{ .bytes = "hi" },
+            .extra = &.{.{ .name = name, .value = "0" }},
+        }));
+        try t.expectEqual(@as(usize, 0), out.end);
+    }
+
+    // The three with a nullable field of their own are NOT reserved: nulling
+    // the field and supplying your own through `extra` is documented advice,
+    // and refusing it would break that.
+    var buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try writeRequest(&out, .{
+        .host = "h",
+        .user_agent = null,
+        .extra = &.{
+            .{ .name = "user-agent", .value = "mine/1" },
+            .{ .name = "authorization", .value = "Bearer x" },
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "x-anything", .value = "fine" },
+        },
+    });
+    try t.expect(std.mem.indexOf(u8, out.buffered(), "user-agent: mine/1\r\n") != null);
+    try t.expect(std.mem.indexOf(u8, out.buffered(), "x-anything: fine\r\n") != null);
 }
