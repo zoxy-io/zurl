@@ -16,6 +16,10 @@ a design rule here — [docs/DESIGN.md](docs/DESIGN.md) has the eight of them.
 
 Zig **0.16.0** exactly — `std.Io` moves, so 0.15 and master are both wrong.
 
+`direnv allow` brings up a pinned shell with that toolchain and curl (the
+other half of `zig build curl-diff`); `devenv shell` does the same without
+direnv. Neither is required if you already have 0.16.0 on `PATH`.
+
 One dependency, [zoxy-io/hparse](https://github.com/zoxy-io/hparse), for the
 head scan. It is std-only and does no I/O, so zurl stays a leaf package: it
 brings no runtime and no TLS stack that could collide with one you already pin.

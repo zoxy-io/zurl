@@ -60,10 +60,13 @@ gate is wrong (change it deliberately, in its own slice) or the slice is.
 
 ## Toolchain
 
-Zig **0.16.0** exactly. The repo has no dev shell of its own yet; if `zig` is
-not on `PATH`, use the 0.16.0 toolchain the sibling `../zoxy` checkout pins
-(`devenv shell` there, or the `zig-0.16.0` path in the nix store). Do not
-build with 0.15 or with master — `std.Io` moves.
+Zig **0.16.0** exactly. Do not build with 0.15 or with master — `std.Io` moves.
+
+The repo pins it: `.envrc` + `devenv.nix` bring up a shell with Zig 0.16.0 and
+curl (the other half of `zig build curl-diff`). `direnv allow` once and bare
+`zig build` works; `devenv shell` if you would rather not use direnv. Inside
+it, `zc` runs every offline gate in order, and `devenv test` runs the same set
+CI does.
 
 ## Policies
 
