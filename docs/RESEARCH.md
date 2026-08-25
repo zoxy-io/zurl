@@ -12,7 +12,7 @@ job:
 |---|---|---|
 | `bench/src/http.zig` | bounded fetch for the cloud control plane | rewritten twice; the first version deliberately leaked on timeout because it could not cancel a thread |
 | `bench/src/cadvisor.zig` | hand-rolled GET + streaming parse | read a chunked body as plain text for months — every 2 KiB a hex chunk-size line was spliced into whatever metric line straddled the boundary, and which series died depended on byte offset |
-| `zrk/src/http.zig` | hot-path response parser in the load generator | correct and fast, but *discards* bodies by design — it cannot serve a client |
+| `zrk/src/http.zig` | hot-path response parser in the load generator | correct and fast, but *discards* bodies by design — it cannot serve a client. Now zurl's, on measured parity; zrk kept only its request builder |
 
 Every bug in the first two was a bug a shared, correct client would have made
 structurally impossible. That is the experiment: can one API serve all these
@@ -49,7 +49,9 @@ The incumbent, and what `bench/src/http.zig` v2 wraps today.
   Parity on keep-alive is the honest headline: both are syscall-bound there, and
   48 ns of parse inside a ~10 µs round trip is 0.5%. The fresh-connection gap is
   where zurl's lack of pooling machinery shows up as an advantage rather than a
-  gap. Any pitch to zrk rests on API and correctness, not speed.
+  gap. Any pitch to zrk rested on API and correctness, not speed — and that is
+  what it was eventually made and won on, though the parser turned out to be
+  faster too (see the consumer table below).
 * **A URL can inject request headers.** Found while scoping zurl's own
   equivalent hole, and worth reporting upstream. `std.Uri.parse` accepts CR and
   LF inside a path and records the span as `Component.percent_encoded`;
@@ -224,12 +226,31 @@ of our per-header advantage above is bought by that omission.
 | `discord.zig` (webhook) | POST multipart, retry loop above it | discard sink, deadline, TLS; 204 must not hang |
 | `cadvisor.zig` (metrics scrape) | GET ~2 MB exposition at 1 Hz **inside the load generator's process** | streaming sink, zero accumulation, decoded framing, whole-request deadline |
 | `suite.probeOnce` (warm probe) | status line only, over **zrk's TLS specifically** — a handshake the probe accepts must be one the measurement accepts | transport injection, head-only parse |
-| `zrk/connection.zig` (hot path) | 67k req/s across 4 threads, keep-alive, byte counting | parser at sub-µs/response; body discard fast path; **adoption gated on measured parity, never assumed** |
+| `zrk/connection.zig` (hot path) | 67k req/s across 4 threads, keep-alive, byte counting | parser at sub-µs/response; body discard fast path; **adopted, on measured parity** |
 
-The last row is the bar for the benchmarks in `bench/`: zrk's hand-rolled
-parser is the number to match before anyone proposes swapping it — and the
-line we drew stands regardless: *zurl for control planes; a load generator's
-inner loop only ever on measured parity.*
+The last row was the bar for the benchmarks in `bench/`, and it has now been
+cleared. Measured A/B against zrk's hand-rolled parser, same wire, same
+`Io.Reader.fixed`, ReleaseFast, five interleaved reps (on battery, so read the
+ratios and not the absolutes):
+
+| shape | zrk | zurl | |
+|---|---|---|---|
+| zrk-1k (2 headers, 1 KiB body) | 88–101 ns | 69–79 ns | **0.79×** |
+| bare status line | 37–48 ns | 21–27 ns | **0.55×** |
+| 8 headers, 128 B body | 117–137 ns | 104–114 ns | **0.85×** |
+
+So zrk parses responses with `parser.parseHead` + `parser.streamBody` now, and
+`Head.head_len` and `Body.wire_len` exist because of it: its `Transfer/sec` is
+wrk's, counted off the wire, and neither number can be rederived from a decoded
+body length. Verified end to end at 87.00 bytes/request against a server
+serving exactly 87 bytes, chunk framing and trailer section included, and
+identical to the hand-rolled parser's count on the same targets.
+
+What zrk did NOT adopt is the line that still stands: `writeRequest`
+re-serializes a request per call, which measured 93–103 ns against 2.6 ns for
+writing a prebuilt blob, and a load generator sends the same request a million
+times. *zurl for control planes; a load generator's inner loop only where the
+measurement says so, and only the half it says so about.*
 
 ## Conclusion — the niche is real
 

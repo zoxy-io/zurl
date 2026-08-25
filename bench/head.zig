@@ -103,7 +103,7 @@ fn hparseHead(r: *Io.Reader, opts: zurl.HeadOptions) !zurl.Head {
 
     // Slices point into the reader's buffer, so nothing is tossed until the
     // framing pass is done with them.
-    const head = try extractFraming(headers[0..header_count], version, status_code, opts);
+    const head = try extractFraming(headers[0..header_count], version, status_code, consumed, opts);
     r.toss(consumed);
     return head;
 }
@@ -162,7 +162,7 @@ fn hparseHeadScan(r: *Io.Reader, opts: zurl.HeadOptions) !zurl.Head {
     // run in, and that is exactly where assertions are gone.
     if (consumed != head_end) return error.ScanConsumedWrong;
 
-    const head = try extractFraming(headers[0..header_count], version, status_code, opts);
+    const head = try extractFraming(headers[0..header_count], version, status_code, consumed, opts);
     r.toss(consumed);
     return head;
 }
@@ -174,10 +174,12 @@ fn extractFraming(
     headers: []const hparse.Header,
     version: hparse.Version,
     status_code: u16,
+    head_len: usize,
     opts: zurl.HeadOptions,
 ) !zurl.Head {
     var head: zurl.Head = .{
         .status = status_code,
+        .head_len = head_len,
         .http11 = version == .@"1.1",
         .keep_alive = version == .@"1.1",
     };
@@ -297,6 +299,9 @@ fn report(name: []const u8, who: []const u8, heads: u64, ns: u64) void {
 
 fn sameHead(a: zurl.Head, b: zurl.Head) bool {
     if (a.status != b.status) return false;
+    // The head's size is part of its answer now: an integration that scanned a
+    // different number of bytes parsed a different head, whatever else agrees.
+    if (a.head_len != b.head_len) return false;
     if (a.http11 != b.http11) return false;
     if (a.keep_alive != b.keep_alive) return false;
     if (a.chunked != b.chunked) return false;

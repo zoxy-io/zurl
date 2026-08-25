@@ -53,6 +53,19 @@ pub const Error = error{
 
 pub const Head = struct {
     status: u16,
+    /// Raw bytes this head occupied on the wire: the status line, every header
+    /// line, and the blank line that ends them, terminators included.
+    ///
+    /// Exposed because a byte counter cannot reconstruct it. Everything else
+    /// here describes what the head MEANT; this is what it COST, and a caller
+    /// reporting throughput off the wire (zrk's `Transfer/sec`, which is wrk's)
+    /// needs the head's share of it as much as the body's. `Body.wire_len` is
+    /// the other half; the two sum to what the exchange took off the transport.
+    ///
+    /// A `usize` rather than a `u64`: it is bounded by `max_head_bytes`, which
+    /// is a buffer bound and therefore a machine-word quantity — unlike a body
+    /// length, which is bounded by nothing this side of the wire.
+    head_len: usize,
     /// The status line began "HTTP/1.1". Decides the keep-alive default.
     http11: bool,
     /// What the head SAID. The final verdict is `Body.keep_alive`, because a
@@ -108,7 +121,18 @@ pub const HeadOptions = struct {
 };
 
 pub const Body = struct {
+    /// Decoded length: what reached the sink. Chunk framing is not in it,
+    /// because chunk framing is not the body.
     len: u64,
+    /// Raw bytes the body cost on the wire, chunk-size lines, their CRLFs and
+    /// any trailer section included. Equal to `len` for a content-length or
+    /// close-delimited body, strictly greater for a chunked one, zero for a
+    /// bodyless reply.
+    ///
+    /// Separate from `len` because the two answer different questions and a
+    /// caller that conflates them is wrong in one of them: a byte-throughput
+    /// meter wants this one, and a caller sizing what it received wants `len`.
+    wire_len: u64,
     /// The connection's fate: the head's verdict, downgraded to false when the
     /// body ran to connection close (nothing further can be framed).
     keep_alive: bool,
@@ -145,6 +169,9 @@ pub fn parseHead(r: *Io.Reader, opts: HeadOptions) Error!Head {
 
     var head: Head = .{
         .status = scan.status,
+        // What `scanHead` consumed IS the head, by its own postcondition: it
+        // returns only when hparse has parsed a complete one out of the window.
+        .head_len = consumed,
         .http11 = scan.version == .@"1.1",
         // HTTP/1.1 defaults to keep-alive; 1.0 defaults to close.
         .keep_alive = scan.version == .@"1.1",
@@ -329,7 +356,7 @@ pub fn streamBody(
     // them, while carrying no body — so refusing on the header alone would
     // break every HEAD against a gzip-serving origin, and `ycs.head` is a
     // real caller. Nothing reaches a sink here, so nothing can be misread.
-    if (head.bodyless(method)) return .{ .len = 0, .keep_alive = head.keep_alive };
+    if (head.bodyless(method)) return .{ .len = 0, .wire_len = 0, .keep_alive = head.keep_alive };
 
     // Rule 2: the caller never sees an undecoded byte. zurl decodes no
     // content codings, so the only honest answers are to refuse or to be told
@@ -337,8 +364,14 @@ pub fn streamBody(
     if (head.encoded_body and !opts.allow_encoded_body) return error.UnsupportedContentEncoding;
 
     if (head.chunked) {
-        const n = try streamChunked(r, sink, opts);
-        return .{ .len = n, .keep_alive = head.keep_alive };
+        const chunked = try streamChunked(r, sink, opts);
+        // Framing is never free: the zero-size chunk and its blank line alone
+        // are five bytes, so a chunked body always costs more wire than it
+        // delivers. Stated as an assertion because `wire_len` is what a
+        // throughput meter reports, and an equality here would mean the
+        // framing was counted as nothing.
+        assert(chunked.wire_len > chunked.len);
+        return .{ .len = chunked.len, .wire_len = chunked.wire_len, .keep_alive = head.keep_alive };
     }
     if (head.content_length) |len| {
         // Transfer-Encoding already won above, so a length that survives to
@@ -350,7 +383,9 @@ pub fn streamBody(
             error.ReadFailed => error.ReadFailed,
             error.WriteFailed => error.WriteFailed,
         };
-        return .{ .len = len, .keep_alive = head.keep_alive };
+        // Content-length framing puts nothing on the wire around the body, so
+        // the decoded length and the wire cost are the same number.
+        return .{ .len = len, .wire_len = len, .keep_alive = head.keep_alive };
     }
 
     // No framing information: the body runs to connection close, which is
@@ -361,13 +396,19 @@ pub fn streamBody(
         error.ReadFailed => error.ReadFailed,
         error.WriteFailed => error.WriteFailed,
     };
-    return .{ .len = n, .keep_alive = false };
+    // Close-delimited: the body is every remaining byte, undecorated.
+    return .{ .len = n, .wire_len = n, .keep_alive = false };
 }
 
-fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
+/// What a chunked body cost, decoded and on the wire. Two numbers because
+/// chunk framing is the difference between them and no caller can rederive it.
+const Chunked = struct { len: u64, wire_len: u64 };
+
+fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!Chunked {
     assert(opts.max_head_bytes > 0);
 
     var total: u64 = 0;
+    var wire: u64 = 0;
     // lint:unbounded-ok — every pass consumes a chunk-size line and returns on
     // the zero-size chunk, so it either advances the stream or ends. A server
     // that streams chunks forever is bounded by the caller's whole-request
@@ -375,16 +416,23 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
     // malicious stream differ in duration, not in shape, and only the caller
     // knows which one it asked for.
     while (true) {
-        var size_budget: usize = 1024; // a chunk-size line is a hex number and maybe extensions
+        const size_budget_max: usize = 1024; // a chunk-size line is a hex number and maybe extensions
+        var size_budget: usize = size_budget_max;
         const size_line = takeLine(r, &size_budget) catch return error.MalformedChunk;
+        // takeLine charges the line's RAW size, terminator included, which is
+        // exactly what the wire cost — so what it spent is what to count.
+        wire += size_budget_max - size_budget;
         // Size is hex, optionally followed by ";extensions" (ignored).
         const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
         const size = std.fmt.parseInt(u64, std.mem.trim(u8, size_line[0..semi], " \t"), 16) catch
             return error.MalformedChunk;
 
         if (size == 0) {
-            try streamTrailers(r, opts);
-            return total;
+            wire += try streamTrailers(r, opts);
+            // The zero-size chunk's own line is already counted, and the
+            // trailer section is at minimum the blank line that ends it.
+            assert(wire > total);
+            return .{ .len = total, .wire_len = wire };
         }
 
         // The zero-size chunk returned above, so every pass reaching here moves
@@ -397,18 +445,22 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
             error.WriteFailed => error.WriteFailed,
         };
         total += size;
+        wire += size;
 
         // Each chunk's data is followed by CRLF — and by exactly that. The
         // hand-rolled reader this replaces ignored the line's content, which
         // let a desynchronised stream limp on to a stranger error later.
-        var crlf_budget: usize = 8;
+        const crlf_budget_max: usize = 8;
+        var crlf_budget: usize = crlf_budget_max;
         const crlf = takeLine(r, &crlf_budget) catch return error.MalformedChunk;
         if (crlf.len != 0) return error.MalformedChunk;
+        wire += crlf_budget_max - crlf_budget;
     }
 }
 
 /// The trailer section: header fields until the blank line, delivered through
-/// the same callback as the head's, under a fresh head-sized budget.
+/// the same callback as the head's, under a fresh head-sized budget. Returns
+/// what it consumed, which is the section's share of `Body.wire_len`.
 ///
 /// A trailer IS a header field (RFC 9112 §7.1.2), so it is held to the head's
 /// rule AND reports the head's errors — a nameless field is
@@ -422,7 +474,7 @@ fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!u64 {
 /// different things depending on where in the message they appeared; and the
 /// validation sat inside the `on_header` branch, so whether a line was
 /// inspected at all depended on whether the caller had installed a listener.
-fn streamTrailers(r: *Io.Reader, opts: HeadOptions) Error!void {
+fn streamTrailers(r: *Io.Reader, opts: HeadOptions) Error!u64 {
     assert(opts.max_head_bytes > 0);
 
     var budget = opts.max_head_bytes;
@@ -431,7 +483,10 @@ fn streamTrailers(r: *Io.Reader, opts: HeadOptions) Error!void {
     while (true) {
         const line = try takeLine(r, &budget);
         assert(budget < opts.max_head_bytes);
-        if (line.len == 0) return;
+        // What the budget lost is what the section cost, terminators included
+        // — the same accounting `streamChunked` does for a chunk-size line,
+        // and the reason `budget` is spent rather than merely checked.
+        if (line.len == 0) return opts.max_head_bytes - budget;
 
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
         const name = line[0..colon];
@@ -519,6 +574,51 @@ test "chunked body reassembles across chunk boundaries, with trailers" {
     try t.expect(head.chunked);
     try t.expectEqual(@as(u64, 9), body.len);
     try t.expectEqualStrings("Wikipedia", out.written());
+}
+
+test "the two wire counts add up to the whole response, in every framing" {
+    // What a byte-throughput meter is made of. `head_len + wire_len` must be
+    // the entire response as it appeared on the wire — every framing, every
+    // segmentation — or a `Transfer/sec` built on them silently under-reports
+    // whatever it forgot to count. The bug this forecloses has no symptom: the
+    // number is merely wrong, and looks fine.
+    const cases = [_]struct { wire: []const u8, method: std.http.Method, len: u64 }{
+        // Content-length: the body costs exactly what it delivers.
+        .{ .wire = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello", .method = .GET, .len = 5 },
+        // Chunked: nine bytes delivered, and the size lines, their CRLFs, the
+        // zero chunk and the trailer section are the gap between the counts.
+        .{
+            .wire = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n" ++
+                "4\r\nWiki\r\n5\r\npedia\r\n0\r\nx-trailer: yes\r\n\r\n",
+            .method = .GET,
+            .len = 9,
+        },
+        // Close-delimited: undecorated, so the two counts agree again.
+        .{ .wire = "HTTP/1.0 200 OK\r\n\r\nrest of stream", .method = .GET, .len = 14 },
+        // Bodyless: the head IS the response, and a body that never comes
+        // costs nothing however loudly content-length announces it.
+        .{ .wire = "HTTP/1.1 204 No Content\r\n\r\n", .method = .GET, .len = 0 },
+        .{ .wire = "HTTP/1.1 200 OK\r\ncontent-length: 1234\r\n\r\n", .method = .HEAD, .len = 0 },
+    };
+
+    // Whole, then one byte per read: rule 4 applies to these two numbers as
+    // much as to the parse that produced them.
+    for ([_]usize{ 0, 1 }) |segment| {
+        for (cases) |case| {
+            var buf: [256]u8 = undefined;
+            var sr = SegmentedReader.init(
+                case.wire,
+                if (segment == 0) case.wire.len else 1,
+                null,
+                &buf,
+            );
+            var out: Io.Writer.Allocating = .init(t.allocator);
+            defer out.deinit();
+            const head, const body = try parseAll(&sr.interface, case.method, &out);
+            try t.expectEqual(case.len, body.len);
+            try t.expectEqual(case.wire.len, head.head_len + body.wire_len);
+        }
+    }
 }
 
 test "segmentation invariance: every split point and byte-at-a-time" {

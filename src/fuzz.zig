@@ -198,6 +198,12 @@ const Outcome = struct {
         chunked: bool,
         content_length: ?u64,
         len: u64,
+        /// The two wire costs, checked here for the same reason everything
+        /// else is: they are what a caller counting bytes off the transport
+        /// reports, and a count that depended on how the wire was segmented
+        /// would be rule 4's exact prohibition in a number nobody looks at.
+        head_len: usize,
+        wire_len: u64,
     };
 };
 
@@ -249,6 +255,8 @@ const Parse = struct {
             .chunked = head.chunked,
             .content_length = head.content_length,
             .len = body.len,
+            .head_len = head.head_len,
+            .wire_len = body.wire_len,
         } } };
     }
 };
@@ -325,6 +333,15 @@ fn expectCoherent(outcome: *const Outcome, method: std.http.Method) !void {
             // delivered — a chunked decoder that miscounts fails here even
             // when every segmentation miscounts alike.
             try t.expectEqual(p.len, @as(u64, outcome.body.len));
+            // A head is at minimum a status line and the blank line that ends
+            // it, so a parse that succeeded consumed bytes to do it.
+            try t.expect(p.head_len > 0);
+            // Chunk framing is the ONLY thing that can sit between the decoded
+            // body and the wire, so the gap is exactly as wide as the framing:
+            // zero without it, and never negative with it.
+            try t.expect(p.wire_len >= p.len);
+            if (!p.chunked) try t.expectEqual(p.len, p.wire_len);
+            if (p.chunked and p.len > 0) try t.expect(p.wire_len > p.len);
             // keep_alive is the head's verdict unless a close-delimited body
             // overrode it, and that override only ever goes one way.
             if (p.keep_alive) try t.expect(p.head_keep_alive);
@@ -363,6 +380,8 @@ fn sameOutcome(a: *const Outcome, b: *const Outcome) bool {
             if (p_a.keep_alive != p_b.keep_alive) return false;
             if (p_a.chunked != p_b.chunked) return false;
             if (p_a.content_length != p_b.content_length) return false;
+            if (p_a.head_len != p_b.head_len) return false;
+            if (p_a.wire_len != p_b.wire_len) return false;
             return p_a.len == p_b.len;
         },
     }
@@ -409,8 +428,8 @@ fn describeOutcome(label: []const u8, outcome: *const Outcome) void {
     switch (outcome.verdict) {
         .failed => |err| std.debug.print("  {s}: {s}", .{ label, @errorName(err) }),
         .parsed => |p| std.debug.print(
-            "  {s}: status={d} http11={} head_keep_alive={} keep_alive={} chunked={} content_length={?d} len={d}",
-            .{ label, p.status, p.http11, p.head_keep_alive, p.keep_alive, p.chunked, p.content_length, p.len },
+            "  {s}: status={d} http11={} head_keep_alive={} keep_alive={} chunked={} content_length={?d} len={d} head_len={d} wire_len={d}",
+            .{ label, p.status, p.http11, p.head_keep_alive, p.keep_alive, p.chunked, p.content_length, p.len, p.head_len, p.wire_len },
         ),
     }
     // Hex, never `{s}`: this is a fuzzed body and the terminal is not asked to

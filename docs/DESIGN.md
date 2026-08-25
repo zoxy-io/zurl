@@ -163,9 +163,12 @@ correct; the *cost* was invisible until measured.
 So `bench/` is part of the deliverable: parser microbenchmarks and an
 end-to-end loopback comparison against std.http.Client, run in ReleaseFast.
 The headline table is in the README; the method is here. The standing rule from
-the parity discussion: zrk adopts nothing from here until these benchmarks say
-parity — and the inner loop of a load generator may simply never be the right
-consumer.
+the parity discussion was that zrk adopts nothing from here until these
+benchmarks say parity. They now do, for the parser and only the parser: it
+measured 0.55–0.85× zrk's hand-rolled one on zrk's own shapes, while
+`writeRequest` measured 36× the cost of replaying a prebuilt request, so the
+load generator took the half that won and kept the half that did not. The rule
+did its job in both directions, which is the point of having it.
 
 ### How to measure so the number means something
 
