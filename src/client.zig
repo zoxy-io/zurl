@@ -204,8 +204,51 @@ pub const Origin = struct {
             return addr.connect(io, .{ .mode = .stream }) catch error.ConnectFailed;
         } else |_| {
             const name = net.HostName.init(origin.host) catch return error.InvalidUrl;
-            return name.connect(io, origin.port, .{ .mode = .stream }) catch error.ConnectFailed;
+            return dialByName(name, origin.port, io);
         }
+    }
+
+    /// Tries each resolved address in turn, rather than
+    /// `std.Io.net.HostName.connect`'s approach of racing them concurrently.
+    ///
+    /// The race has been observed to hand back a `Stream` whose connect
+    /// "won" while a losing attempt's cancellation closed the SAME
+    /// descriptor out from under it: the socket reports connected but fails
+    /// `error.SocketUnconnected` on the very first write. Reproduced with a
+    /// plain hostname dial against a real dual-stack origin (an IPv6 address
+    /// that cannot actually be reached wins the race; a subsequent IPv4-only
+    /// literal dial of the same origin works). Sequential trial cannot hit
+    /// that: only one connect is ever in flight, so a `Stream` this returns
+    /// has genuinely completed its handshake — the cost is that a dead first
+    /// address is discovered serially rather than in parallel with a live
+    /// second one.
+    fn dialByName(name: net.HostName, port: u16, io: Io) Error!net.Stream {
+        assert(name.bytes.len > 0);
+        assert(port != 0);
+
+        var lookup_buf: [32]net.HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(net.HostName.LookupResult) = .init(&lookup_buf);
+        // `error.Canceled` is the whole-request deadline firing (rule 3) and
+        // must reach the caller as itself, not as a connect failure it can
+        // sensibly retry — the same distinction src/tls.zig's `Error` set
+        // draws around its own `Canceled` member.
+        name.lookup(io, &lookup_queue, .{ .port = port }) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => return error.ConnectFailed,
+        };
+
+        while (lookup_queue.getOne(io)) |result| switch (result) {
+            .canonical_name => continue,
+            .address => |addr| return addr.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => continue,
+            },
+        } else |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.Closed => {},
+        }
+
+        return error.ConnectFailed;
     }
 };
 
@@ -999,6 +1042,57 @@ test "fetch against a live loopback server, deadline against a black hole" {
         .what = "black hole",
     });
     try t.expectEqual(@as(?connection.Response, null), timed_out);
+}
+
+test "fetch dials a hostname through the resolver, tolerating an unreachable address" {
+    var threaded: Io.Threaded = .init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    const Serve = struct {
+        fn run(srv: *net.Server, sio: Io) void {
+            var s = srv.accept(sio) catch return;
+            defer s.close(sio);
+            var rb: [2048]u8 = undefined;
+            var rr = s.reader(sio, &rb);
+            while (true) {
+                const line = rr.interface.takeDelimiterInclusive('\n') catch return;
+                if (line.len <= 2) break;
+            }
+            var wb: [512]u8 = undefined;
+            var ww = s.writer(sio, &wb);
+            ww.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nzurl") catch return;
+            ww.interface.flush() catch return;
+        }
+    };
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Serve.run, .{ &server, io });
+
+    // "localhost" forces the hostname path (`Origin.dialByName`) instead of
+    // the IP-literal path every other fetch test here takes; `/etc/hosts`
+    // resolves it with no network needed. Most hosts list an IPv6 loopback
+    // entry ahead of the IPv4 one, so this also tends to exercise falling
+    // through an address nothing is listening on: nothing here binds `::1`,
+    // so a resolver returning it first must be tried and skipped before the
+    // `127.0.0.1` listener above is ever reached — the sequential-trial
+    // dial this guards against regressing to `HostName.connect`'s racing
+    // one, which was observed handing back a `Stream` that reports
+    // connected and then fails `error.SocketUnconnected` on the first
+    // write.
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://localhost:{d}/hello", .{port});
+
+    var body: Io.Writer.Allocating = .init(t.allocator);
+    defer body.deinit();
+    const res = (try fetch(io, .{ .url = url, .sink = .{ .collect = &body } })).?;
+    try t.expectEqual(@as(u16, 200), res.status);
+    try t.expectEqualStrings("zurl", body.written());
 }
 
 test "a backend that cannot spawn refuses the fetch rather than running it unbounded" {
