@@ -1,6 +1,6 @@
 .{
     .name = .zurl,
-    .version = "0.0.1",
+    .version = "0.0.2",
     .fingerprint = 0x2ef103580a0b50f9, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     // ONE dependency, deliberately, and the argument for it is in
