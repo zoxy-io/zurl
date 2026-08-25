@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 const zurl = @import("zurl");
 const cli_args = @import("args.zig");
 
@@ -68,7 +69,7 @@ fn usage() void {
         \\  -L, --location           -u, --user <user:pass>   -A, --user-agent <ua>
         \\  -k, --insecure           --cacert <file>          --max-time <seconds>
         \\  -I, --head               -f, --fail               -s, --silent
-        \\  -w, --write-out <fmt>    (%{{http_code}} %{{size_download}} %{{size_header}})
+        \\  -v, --verbose            -w, --write-out <fmt>    (%{{http_code}} %{{size_download}} %{{size_header}})
         \\
         \\No --compressed: zurl decodes no content codings, so it never asks for one.
         \\
@@ -126,6 +127,10 @@ fn run(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, args: *const cl
 
     // A head we could not fully record is a head we must not claim to show.
     if (recorder.failed) return error.OutOfMemory;
+
+    // Before the `-f` refusal message: `-v`'s whole point is showing what
+    // happened, refusal included, not just what a successful run looks like.
+    if (args.verbose) try writeVerbose(io, response.status, headers.written());
 
     // curl still writes its `-w` output when `-f` fails, and still exits 22.
     // Returning early here skipped it — found by curl-diff on its first run,
@@ -241,6 +246,36 @@ fn writeOutputs(
     // whole point of pairing `-o /dev/null` with it.
     if (args.write_out) |format| try writeOut(&stdout.interface, format, response, head, body);
     try stdout.interface.flush();
+}
+
+/// `-v`: the response status and headers, to stderr — never stdout, so it
+/// never touches what `-i`/`-I`/`-o` show or curl-diff compares.
+///
+/// `curl-diff` redirects both clients' stderr to `/dev/null`, so this output
+/// has no curl shape to match; there is no `HTTP/1.1` on the status line the
+/// way curl prints one, because that would be invented rather than read off
+/// the wire — `Response` carries only `status`, not the protocol version the
+/// parser itself does track (`Head.http11`, never plumbed out this far) or a
+/// reason phrase (hparse discards it) — and there is no request-side echo
+/// because the CLI has no captured copy of the request bytes it sent, only
+/// the args it built them from.
+fn writeVerbose(io: Io, status: u16, head: []const u8) !void {
+    assert(status >= 100);
+    assert(status <= 999);
+
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_file = Io.File.stderr();
+    var stderr = stderr_file.writerStreaming(io, &stderr_buf);
+
+    try stderr.interface.print("< status: {d}\r\n", .{status});
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    // lint:unbounded-ok — `head` is finite, and the head-recording check
+    // above the call site guarantees it is a complete buffer.
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try stderr.interface.print("< {s}\r\n", .{line});
+    }
+    try stderr.interface.flush();
 }
 
 fn writeFile(io: Io, path: []const u8, bytes: []const u8) !void {

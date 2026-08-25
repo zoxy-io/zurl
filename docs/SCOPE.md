@@ -291,8 +291,17 @@ rule 4 fuzz oracle, one level up. Same request, same answer as curl, or one of
 them is wrong.
 
 That also bounds its scope. It implements `-X -H -d -o -i -D -L -u -A
---max-time -k --cacert -I -f -s` and a `-w` subset of `http_code`,
+--max-time -k --cacert -I -f -s -v` and a `-w` subset of `http_code`,
 `size_download` and `size_header`. Not the other two hundred.
+
+**`-v` is the one flag here that does not earn its place through the oracle.**
+Its output goes to stderr, which `curl-diff` never captures (`2>/dev/null` on
+both clients), so there is nothing for it to compare. It exists because a
+plain GET against a 3xx with an empty body (redirects routinely have one) was
+indistinguishable from a plain GET against nothing at all, and the only way
+to see why was `-I` — which sends a HEAD, a different request than the one
+actually failing to explain itself. `-v` prints the real response's status
+and headers to stderr, independent of and without altering `-i`/`-I`/`-o`.
 
 **`--compressed` is not among them**, and its absence is this document keeping
 itself honest — it was on the list above until the binary was written. zurl

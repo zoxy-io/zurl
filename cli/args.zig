@@ -8,6 +8,13 @@
 //! point of the binary is a differential oracle — same request to curl and to
 //! zurl, same answer or one of them is wrong — so a flag earns its place by
 //! making that comparison possible, not by existing in curl.
+//!
+//! `-v` is the one deliberate exception. Its output goes to stderr, which
+//! `curl-diff` never captures, so it earns its place on usability alone: a
+//! plain GET against a 3xx with an empty body (redirects routinely have one)
+//! is otherwise indistinguishable from a plain GET against nothing at all,
+//! and the only way to see why was `-I`, which sends a different request
+//! than the one actually failing to explain itself.
 
 const std = @import("std");
 const zurl = @import("zurl");
@@ -50,6 +57,10 @@ pub const Args = struct {
     fail_on_error: bool = false,
     silent: bool = false,
     write_out: ?[]const u8 = null,
+    /// `-v`: the response status and headers go to stderr, whatever `-i`/`-I`
+    /// send to stdout. Independent of both — off by default, and does not
+    /// suppress or replace either's output.
+    verbose: bool = false,
 
     /// The file output goes to, or null for stdout.
     ///
@@ -134,6 +145,8 @@ pub fn parse(arena: std.mem.Allocator, argv: []const []const u8) Error!Args {
             args.fail_on_error = true;
         } else if (match(arg, "-s", "--silent")) {
             args.silent = true;
+        } else if (match(arg, "-v", "--verbose")) {
+            args.verbose = true;
         } else {
             // Unknown flags are refused, never ignored. A silently dropped
             // `--compressed` would make the differential oracle compare two
@@ -208,19 +221,20 @@ test "the flags a differential run needs, long and short" {
     const arena = arena_state.allocator();
 
     const args = try parseSlice(arena, &.{
-        "-X",           "PUT",
-        "-H",           "X-One: 1",
-        "--header",     "X-Two:2",
-        "-d",           "body",
-        "-o",           "out.bin",
-        "-L",           "-i",
-        "-k",           "--max-time",
-        "7",            "-u",
-        "user:pass",    "-A",
-        "agent/1",      "--cacert",
-        "/tmp/ca.pem",  "-f",
-        "-s",           "-w",
-        "%{http_code}", "https://example.com/thing",
+        "-X",                        "PUT",
+        "-H",                        "X-One: 1",
+        "--header",                  "X-Two:2",
+        "-d",                        "body",
+        "-o",                        "out.bin",
+        "-L",                        "-i",
+        "-k",                        "--max-time",
+        "7",                         "-u",
+        "user:pass",                 "-A",
+        "agent/1",                   "--cacert",
+        "/tmp/ca.pem",               "-f",
+        "-s",                        "-v",
+        "-w",                        "%{http_code}",
+        "https://example.com/thing",
     });
 
     try t.expectEqual(std.http.Method.PUT, args.effectiveMethod());
@@ -241,6 +255,7 @@ test "the flags a differential run needs, long and short" {
     try t.expectEqualStrings("/tmp/ca.pem", args.cacert_path.?);
     try t.expect(args.fail_on_error);
     try t.expect(args.silent);
+    try t.expect(args.verbose);
     try t.expectEqualStrings("%{http_code}", args.write_out.?);
 }
 
