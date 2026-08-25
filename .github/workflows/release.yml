@@ -1,0 +1,264 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+# or run manually from the Actions tab, supplying the tag.
+#
+# `release.yml` only ever runs on a tag, so a change to it is unverifiable
+# except by cutting a release — and a broken release tag is public and
+# half-published. Hence `dry_run`: dispatch with an existing tag and it builds,
+# packages, gathers and checksums exactly as a real release does, then stops
+# before publishing anything or touching the tap. Use it after editing this
+# file.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+      dry_run:
+        description: 'Build and package only — publish nothing, touch no tap'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # One job so the derivation lives in one place. Matrix jobs can declare
+  # outputs, but which matrix leg's value survives is unspecified when they
+  # differ — not a race worth inviting for two `${ref#v}` expansions.
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      dry: ${{ steps.ver.outputs.dry }}
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          # On `push` there are no inputs at all, so this is empty and the
+          # release is real. Only an explicit dispatch can ask for a dry run.
+          # The publish steps gate on `dry == 'false'` rather than
+          # `!= 'true'`, so this output going missing blocks a release instead
+          # of publishing one that was asked to be a rehearsal. A release that
+          # did not happen can be re-run; one that did cannot be unpublished.
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "dry=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry run — building $ref, publishing nothing"
+          else
+            echo "dry=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # zurl is a leaf package with no C dependency (rule 6): hparse is std-only,
+  # so zig cross-compiles every target cleanly from one Linux runner — unlike
+  # zoxy, which had to move to one runner per target the moment TLS gave it a
+  # `linkSystemLibrary("crypto")` (see zoxy's release.yml for what that cost).
+  # zurl has no such dependency, so it stays on the simpler, cheaper shape.
+  build:
+    name: build ${{ matrix.label }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      # Which target broke is the useful answer, not that one did.
+      fail-fast: false
+      matrix:
+        include:
+          - { zig: x86_64-linux-musl,  label: x86_64-linux }
+          - { zig: aarch64-linux-musl, label: aarch64-linux }
+          - { zig: x86_64-macos,       label: x86_64-macos }
+          - { zig: aarch64-macos,      label: aarch64-macos }
+    steps:
+      # A dispatch defaults to the branch it was launched from, which would
+      # build one commit and label it with another's version. Build the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Same pinned action ci.yml uses; `version` is left empty so it reads
+      # `minimum_zig_version` from build.zig.zon — one source for the pin.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          mkdir -p dist
+          zig build -Dtarget="${{ matrix.zig }}" -Doptimize=ReleaseFast --prefix out
+          # Tar here, before the artifact layer sees it: `upload-artifact` zips
+          # its payload and drops the executable bit. Inside a tarball the mode
+          # is data, so it survives the round trip by construction.
+          tar czf "dist/zurl-$version-${{ matrix.label }}.tar.gz" -C out/bin zurl
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zurl-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zurl-*
+          merge-multiple: true
+          path: dist
+
+      # SHA256SUMS.txt covers all four archives, so it can only be written once
+      # they are all here — a matrix leg computing its own would be four files
+      # racing for one name.
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS.txt )
+          cat dist/SHA256SUMS.txt
+          count=$(ls dist/*.tar.gz | wc -l)
+          [ "$count" -eq 4 ] || { echo "expected 4 archives, found $count"; exit 1; }
+
+      # Curated notes when `docs/releases/<tag>.md` exists, generated otherwise.
+      - name: Select release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          path="docs/releases/${{ needs.version.outputs.tag }}.md"
+          if [ -f "$path" ]; then
+            echo "path=$path" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+            echo "using curated notes from $path"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+            echo "no $path; generating notes from commits"
+          fi
+
+      - name: Publish GitHub Release
+        if: needs.version.outputs.dry == 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          files: dist/*
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
+
+      # A guard that fails closed can fail *silently*: if `dry` were ever
+      # anything but the 'false' those steps test for, a real release would
+      # skip both of them and still report success — a green run that shipped
+      # nothing. So check the outcome rather than trusting the condition.
+      #
+      # This one is deliberately `!= 'true'`: erring towards running a check is
+      # the safe direction, the opposite of erring towards publishing.
+      - name: Verify the release was published
+        if: needs.version.outputs.dry != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+          gh release view "$tag" --json assets --jq '.assets[].name' | tee assets.txt
+          count=$(grep -c '\.tar\.gz$' assets.txt)
+          [ "$count" -eq 4 ] || { echo "expected 4 archives on $tag, found $count"; exit 1; }
+          grep -qx 'SHA256SUMS.txt' assets.txt || { echo "no SHA256SUMS.txt on $tag"; exit 1; }
+          echo "$tag published with 4 archives and checksums"
+
+      - name: Update Homebrew formula
+        if: needs.version.outputs.dry == 'false'
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          tag="${{ needs.version.outputs.tag }}"
+
+          sha_aarch64_macos=$(grep "zurl-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_macos=$(grep  "zurl-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_aarch64_linux=$(grep "zurl-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_linux=$(grep  "zurl-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
+
+          mkdir -p ~/.ssh
+          echo "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes"
+
+          git clone git@github.com:zoxy-io/homebrew-tap.git
+          cd homebrew-tap
+
+          cat > Formula/zurl.rb << FORMULA
+          class Zurl < Formula
+            desc "Zero-allocation std.Io-native HTTP/1.1 client for Zig"
+            homepage "https://github.com/zoxy-io/zurl"
+            license "MIT"
+
+            livecheck do
+              url "https://github.com/zoxy-io/zurl"
+              strategy :github_latest
+            end
+
+            on_macos do
+              on_arm do
+                url "https://github.com/zoxy-io/zurl/releases/download/$tag/zurl-$version-aarch64-macos.tar.gz"
+                sha256 "$sha_aarch64_macos"
+              end
+              on_intel do
+                url "https://github.com/zoxy-io/zurl/releases/download/$tag/zurl-$version-x86_64-macos.tar.gz"
+                sha256 "$sha_x86_64_macos"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/zoxy-io/zurl/releases/download/$tag/zurl-$version-aarch64-linux.tar.gz"
+                sha256 "$sha_aarch64_linux"
+              end
+              on_intel do
+                url "https://github.com/zoxy-io/zurl/releases/download/$tag/zurl-$version-x86_64-linux.tar.gz"
+                sha256 "$sha_x86_64_linux"
+              end
+            end
+
+            def install
+              bin.install "zurl"
+            end
+
+            test do
+              output = shell_output("#{bin}/zurl 2>&1", 1)
+              assert_match "usage: zurl", output
+            end
+          end
+          FORMULA
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "zurl: update to $version"
+          git push
+
+      - name: Dry run summary
+        if: needs.version.outputs.dry == 'true'
+        run: |
+          {
+            echo "### Dry run — nothing was published"
+            echo
+            echo "Built \`${{ needs.version.outputs.tag }}\`, packaged four archives,"
+            echo "and stopped before the release and the tap."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
