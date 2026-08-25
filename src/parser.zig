@@ -407,6 +407,11 @@ const Chunked = struct { len: u64, wire_len: u64 };
 fn streamChunked(r: *Io.Reader, sink: *Io.Writer, opts: HeadOptions) Error!Chunked {
     assert(opts.max_head_bytes > 0);
 
+    // Both accumulate for as long as the peer keeps sending, and neither can
+    // wrap: `streamExact64` delivers every byte counted here before it is
+    // counted, so overflowing a u64 means taking 16 exbibytes off the wire.
+    // The bound is the transport's, which is the same bargain the loop below
+    // makes about its own termination.
     var total: u64 = 0;
     var wire: u64 = 0;
     // lint:unbounded-ok — every pass consumes a chunk-size line and returns on
@@ -601,8 +606,17 @@ test "the two wire counts add up to the whole response, in every framing" {
         .{ .wire = "HTTP/1.1 200 OK\r\ncontent-length: 1234\r\n\r\n", .method = .HEAD, .len = 0 },
     };
 
-    // Whole, then one byte per read: rule 4 applies to these two numbers as
-    // much as to the parse that produced them.
+    // Whole, then one byte per read — two segmentations, not the every-split
+    // sweep rule 4 asks for, and the division of labour is deliberate. What
+    // this test proves is that the sum is CORRECT, which needs a hand-counted
+    // expectation and therefore a fixed set of shapes. That the sum does not
+    // DEPEND on segmentation is proved where it can be proved generally:
+    // `src/fuzz.zig` carries both counts through `sameOutcome`, so every
+    // corpus seed is required to agree on them at every two-segment split and
+    // byte-at-a-time. Neither half is sufficient alone — a parser that
+    // miscounted identically under every segmentation would pass the oracle,
+    // and one that counted correctly only when the head arrived whole would
+    // pass this.
     for ([_]usize{ 0, 1 }) |segment| {
         for (cases) |case| {
             var buf: [256]u8 = undefined;
