@@ -100,13 +100,13 @@ probe accepts is one the measurement will accept. A client that insists on its
 own TLS cannot express that property.
 
 A `Connection` is a `*Io.Reader` + `*Io.Writer` pair, full stop. Plain TCP,
-std TLS, zrk's ztls, an in-memory pipe in a test — all the same type. `fetch`
-is the convenience layer that dials for you; `Connection` is the layer that
-does not care.
+std TLS, zrk's own TLS, an in-memory pipe in a test — all the same type.
+`fetch` is the convenience layer that dials for you; `Connection` is the
+layer that does not care.
 
 TLS is the rule's own test case, and it passed: `src/tls.zig` is an adapter
 that turns one reader/writer pair into another, `Connection` was not touched to
-make https work, and a consumer who prefers zrk's ztls hands `Connection` its
+make https work, and a consumer who brings its own TLS hands `Connection` its
 own two pointers and never compiles the file.
 
 Verified live rather than asserted, by `zig build tls-smoke`: example.com
@@ -132,7 +132,7 @@ of:
 
 - **std-only itself**, so it cannot drag a runtime or a TLS stack in behind it.
   hparse takes a byte slice and writes spans. It has no I/O, so there is
-  nothing for a consumer's zio or ztls to collide with.
+  nothing for a consumer's zio or TLS stack to collide with.
 - **Version-locked with zurl, not with the consumer.** hparse and zurl are the
   same project under one owner and are bumped together, so a consumer never
   arbitrates between them. A pin a consumer might *also* pin independently is
@@ -233,6 +233,6 @@ Two things left this list once the consumer was actually surveyed, and
 
 TLS is no longer among them, and the way it landed is the rule working:
 `src/tls.zig` is an adapter that turns one `*Io.Reader`/`*Io.Writer` pair into
-another, `Connection` is unchanged, and a consumer that prefers zrk's ztls
+another, `Connection` is unchanged, and a consumer that brings its own TLS
 still hands `Connection` its own two pointers and never compiles the file.
 The trust anchors stay the caller's — loading them allocates.

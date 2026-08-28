@@ -56,7 +56,7 @@ say *what must be true*. Neither overrides the other.
   `Connection` cannot tell a TLS transport from a socket or from a pair of
   fixed buffers in a test. A TLS implementation arrives as a transport that
   produces those two pointers, never as a branch inside the parser; a
-  consumer that prefers zrk's ztls hands `Connection` its own two pointers and
+  consumer that terminates TLS itself hands `Connection` two pointers and
   never compiles `tls.zig` at all. Adding a third exception needs the same
   argument these two made.
 

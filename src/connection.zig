@@ -1,9 +1,10 @@
 //! One HTTP/1.1 connection over an injected transport.
 //!
 //! A `Connection` is a `*Io.Reader` and a `*Io.Writer`, full stop (design
-//! rule 5). Plain TCP, std TLS, zrk's ztls, an in-memory pipe in a test — all
-//! the same type. Whoever owns the transport owns its lifetime and its close;
-//! the connection only tracks whether HTTP framing permits reuse.
+//! rule 5). Plain TCP, std TLS, zrk's own TLS, an in-memory pipe in a
+//! test — all the same type. Whoever owns the transport owns its lifetime
+//! and its close; the connection only tracks whether HTTP framing permits
+//! reuse.
 
 const std = @import("std");
 const Io = std.Io;

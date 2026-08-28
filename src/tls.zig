@@ -5,7 +5,7 @@
 //! writer, and exposes a plaintext reader and writer. So this file is an
 //! adapter and nothing else. No branch reaches into the parser, nothing above
 //! it knows whether the bytes were encrypted, and a caller who would rather
-//! terminate TLS with zrk's ztls hands `Connection` those two pointers instead
+//! terminate TLS itself hands `Connection` those two pointers instead
 //! and never compiles this file at all. That is the whole point of the seam:
 //! `suite.probeOnce` speaks over zrk's TLS specifically, so that a handshake
 //! the probe accepts is one the measurement will accept, and a client that

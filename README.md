@@ -195,7 +195,7 @@ const res = try zurl.fetch(io, .{
 `fetch` dials, sends `connection: close`, and hangs up — right for a poll or a
 one-shot, wasteful for a dozen calls to one origin. `Connection` is the layer
 underneath: a `*Io.Reader` and a `*Io.Writer`, and it does not care where they
-came from — plain TCP, std TLS, zrk's ztls, or two fixed buffers in a test.
+came from — plain TCP, std TLS, zrk's own TLS, or two fixed buffers in a test.
 
 ```zig
 var conn = zurl.Connection.init(transport.reader(), transport.writer());
