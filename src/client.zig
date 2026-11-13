@@ -1123,7 +1123,7 @@ test "a second spawn that fails unwinds the first without freeing it under a liv
     // A one-spare-thread budget is a legitimate configuration, not a
     // pathological one, so this path is reachable in production and not just
     // in a test that contrives it.
-    var threaded: Io.Threaded = .init(t.allocator, .{ .concurrent_limit = @enumFromInt(1) });
+    var threaded: Io.Threaded = .init(t.allocator, .{ .concurrent_limit = @fromBackingInt(@intCast(1)) });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1229,7 +1229,7 @@ test "max_head_bytes is the caller's, and refuses a head that outgrows it" {
     defer server.deinit(io);
     const port = server.socket.address.getPort();
 
-    const response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-pad: " ++ ("p" ** 200) ++ "\r\n\r\nhi";
+    const response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-pad: " ++ &@as([200]u8, @splat('p')) ++ "\r\n\r\nhi";
 
     var group: Io.Group = .init;
     defer group.cancel(io);

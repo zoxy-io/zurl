@@ -49,7 +49,7 @@ const Server = struct {
                 if (line.len <= 2) break; // blank line: end of head
                 saw_any = true;
                 if (std.ascii.startsWithIgnoreCase(line, "connection:") and
-                    std.ascii.indexOfIgnoreCase(line, "close") != null) close = true;
+                    std.ascii.findIgnoreCase(line, "close") != null) close = true;
             }
             if (!saw_any) return;
             w.writeAll(responseBytes()) catch return;

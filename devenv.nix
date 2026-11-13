@@ -20,9 +20,9 @@ in
 {
   packages =
     [
-      # Zig 0.16.0 exactly. `build.zig.zon`'s `minimum_zig_version` is the
+      # Zig 0.17.0 exactly. `build.zig.zon`'s `minimum_zig_version` is the
       # other half of this pin, and CI reads that rather than restating it.
-      pkgs.zig_0_16
+      pkgs.zig_0_17
       # The other half of `zig build curl-diff`.
       pkgs.curl
     ]

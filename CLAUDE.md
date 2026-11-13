@@ -1,6 +1,6 @@
 # zurl
 
-An experimental `std.Io`-native HTTP/1.1 client for Zig 0.16. One dependency,
+An experimental `std.Io`-native HTTP/1.1 client for Zig 0.17. One dependency,
 `zoxy-io/hparse`, for the head scan; no runtime and no TLS stack (rule 6).
 Read before writing code:
 
@@ -60,9 +60,9 @@ gate is wrong (change it deliberately, in its own slice) or the slice is.
 
 ## Toolchain
 
-Zig **0.16.0** exactly. Do not build with 0.15 or with master — `std.Io` moves.
+Zig **0.17.0** exactly. Do not build with 0.16 or with master — `std.Io` moves.
 
-The repo pins it: `.envrc` + `devenv.nix` bring up a shell with Zig 0.16.0 and
+The repo pins it: `.envrc` + `devenv.nix` bring up a shell with Zig 0.17.0 and
 curl (the other half of `zig build curl-diff`). `direnv allow` once and bare
 `zig build` works; `devenv shell` if you would rather not use direnv. Inside
 it, `zc` runs every offline gate in order, and `devenv test` runs the same set
