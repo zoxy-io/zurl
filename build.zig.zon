@@ -2,7 +2,7 @@
     .name = .zurl,
     .version = "0.0.2",
     .fingerprint = 0x2ef103580a0b50f9, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // ONE dependency, deliberately, and the argument for it is in
     // docs/RESEARCH.md rather than in this comment: hparse's head scanner is
     // faster than the one it replaces, and zoxy-io/zurl and zoxy-io/hparse are
@@ -21,8 +21,8 @@
     // fetch failure deferred to first use.
     .dependencies = .{
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1",
-            .hash = "hparse-0.2.0-IukW0vD7AwCZKtRWydtUnnrsIsiHHYvVNPRsyty5M7GX",
+            .url = "git+https://github.com/zoxy-io/hparse#7f57ef8183f15ebd62f5f9ca631f69a9afdbc421",
+            .hash = "hparse-0.2.0-IukW0jqfAwDmg7ZWyJSUjHGaocYJuqDaNIo8A9URJOjo",
         },
     },
     .paths = .{

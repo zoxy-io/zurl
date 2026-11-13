@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&exe.step);
 
         const run = b.addRunArtifact(exe);
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         hparse_step.dependOn(&run.step);
     }
 
@@ -119,7 +119,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&cli_tests.step);
 
     const cli_run = b.addRunArtifact(cli);
-    if (b.args) |cli_argv| cli_run.addArgs(cli_argv);
+    cli_run.addPassthruArgs();
     b.step("cli", "Run the zurl binary: -- <args>").dependOn(&cli_run.step);
 
     // The differential oracle: the same request through curl and through the
@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) void {
     const curl_diff = b.addSystemCommand(&.{"sh"});
     curl_diff.addFileArg(b.path("smoke/curl-diff.sh"));
     curl_diff.addArtifactArg(cli);
-    if (b.args) |diff_argv| curl_diff.addArgs(diff_argv);
+    curl_diff.addPassthruArgs();
     // Inherited stdio: the per-case list IS the report, and a gate whose
     // output only appears when it fails is one nobody reads while it passes.
     // `has_side_effects` keeps it from being cached away -- it talks to a
@@ -158,7 +158,7 @@ pub fn build(b: *std.Build) void {
 
     const tls_smoke_step = b.step("tls-smoke", "Live TLS handshake against a real origin");
     const tls_smoke_run = b.addRunArtifact(tls_smoke);
-    if (b.args) |args| tls_smoke_run.addArgs(args);
+    tls_smoke_run.addPassthruArgs();
     tls_smoke_step.dependOn(&tls_smoke_run.step);
 
     // Benchmarks are executables, not tests: they print numbers and never
@@ -178,7 +178,7 @@ pub fn build(b: *std.Build) void {
 
         const step = b.step("bench-" ++ name, "Run the " ++ name ++ " benchmark");
         const run = b.addRunArtifact(exe);
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         step.dependOn(&run.step);
     }
 }

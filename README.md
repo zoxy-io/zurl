@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/zoxy-io/zurl/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zurl/actions/workflows/ci.yml)
 
-An **experimental** `std.Io`-native HTTP/1.1 client for Zig 0.16 — zero
+An **experimental** `std.Io`-native HTTP/1.1 client for Zig 0.17 — zero
 allocation, one dependency, and a whole-request deadline that actually fires.
 
 Every design choice traces back to a real incident — a segfault, an unbounded
@@ -14,7 +14,7 @@ hang, a leak on timeout, a body read as plain text — recorded as a rule in
 
 ## Requirements
 
-Zig **0.16.0** exactly — `std.Io` moves, so 0.15 and master are both wrong.
+Zig **0.17.0** exactly — `std.Io` moves, so 0.16 and master are both wrong.
 
 One dependency, [zoxy-io/hparse](https://github.com/zoxy-io/hparse), for the
 head scan. It is std-only and does no I/O, so zurl stays a leaf package: it
@@ -24,7 +24,7 @@ brings no runtime and no TLS stack that could collide with one you already pin.
 
 `direnv allow` brings up a pinned shell with the toolchain and curl (the
 other half of `zig build curl-diff`); `devenv shell` does the same without
-direnv. Neither is required if you already have 0.16.0 on `PATH`.
+direnv. Neither is required if you already have 0.17.0 on `PATH`.
 
 ```sh
 zig fetch --save git+https://github.com/zoxy-io/zurl
