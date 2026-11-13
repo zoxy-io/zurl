@@ -21,8 +21,8 @@
     // fetch failure deferred to first use.
     .dependencies = .{
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1",
-            .hash = "hparse-0.2.0-IukW0vD7AwCZKtRWydtUnnrsIsiHHYvVNPRsyty5M7GX",
+            .url = "git+https://github.com/zoxy-io/hparse#e243cd90b8964fa1c967f6d5c5fdfffa96c34aa3",
+            .hash = "hparse-0.2.0-IukW0jqfAwDmg7ZWyJSUjHGaocYJuqDaNIo8A9URJOjo",
         },
     },
     .paths = .{
